@@ -985,9 +985,10 @@ class StartupModeModel(QtCore.QAbstractListModel):
         return self.roles
 
     def _get_current_selection_index(self) -> int:
-        return self._valid_names.index(
-            self._profile.settings.startup_mode
-        )
+        mode = self._profile.settings.startup_mode
+        if mode not in self._valid_names:
+            return 0
+        return self._valid_names.index(mode)
 
     def _set_current_selection_index(self, index: int) -> None:
         if index != self._get_current_selection_index():

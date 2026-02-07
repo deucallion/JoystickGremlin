@@ -449,14 +449,14 @@ class ProfileConverter:
             for cp in mapping_node.findall("control-point"):
                 x = cp.get("x", "0.0")
                 y = cp.get("y", "0.0")
-                cp_props.append(("point2d", "point", f"({x}, {y})"))
+                cp_props.append(("point2d", "point", f"{x},{y}"))
             extra.append(("control-points", cp_props))
         else:
             # Default linear curve
             props.append(("string", "curve-type", "PiecewiseLinear"))
             extra.append(("control-points", [
-                ("point2d", "point", "(-1.0, -1.0)"),
-                ("point2d", "point", "(1.0, 1.0)"),
+                ("point2d", "point", "-1.0,-1.0"),
+                ("point2d", "point", "1.0,1.0"),
             ]))
 
         action = ActionEntry(

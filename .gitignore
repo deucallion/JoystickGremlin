@@ -1,26 +1,25 @@
-# IDE & tool generated files
-*.sw[op]
-*.pyc
-*.wxs
-poetry.lock
+# C++ build
+plugin/build/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.lib
+*.exp
+*.pdb
 
-# IDE & Python generated folders
-__pycache__
-.idea
-.pytest_cache
-.qt_for_python
-.vscode
-.jekyll_cache
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
 
-# Logfiles
-dill_debug.log
-
-# Development folders
-/build
-/doc/build
-/doc/api
-/dist
-/releases
-/venv
-/.venv
-/gh_page/_site
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

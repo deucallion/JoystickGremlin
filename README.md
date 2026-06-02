@@ -1,60 +1,84 @@
-# Joystick Gremlin
+# Mumble Voice Overlay (Star Citizen)
 
-## Introduction
+An **EAC-safe voice overlay for Mumble**. It shows who is currently talking —
+and as much as Mumble knows about them — in an always-on-top window over your
+game.
 
-**Getting Help:** If you have issues running Gremlin or questions on how to
-make certain things work, the best place to ask for help is in the
-`#joystick-gremlin` channel on the [HOTAS Discord](https://discord.gg/hotas).
+## Why this exists
 
-Joystick Gremlin is a program that allows the configuration of joystick like devices, similar to what CH Control Manager and Thrustmaster's T.A.R.G.E.T. do for their respectively supported joysticks. However, Joystick Gremlin works with any device be it from different manufacturers or custom devices that appear as a joystick to Windows. Joystick Gremlin uses the virtual joysticks provided by vJoy to map physical to virtual inputs and apply various other transformations such as response curves to analogue axes. In addition to customizing joysticks, Joystick Gremlin also provides powerful macro functionalities, a flexible mode system, scripting using Python, and many other features.
+Mumble ships an excellent overlay, but it works by **injecting into the game's
+rendering pipeline** (hooking OpenGL/Direct3D). Anti-cheat systems like Star
+Citizen's **Easy Anti-Cheat (EAC)** treat that injection as tampering, so the
+Mumble overlay simply doesn't show — and at worst trips anti-cheat.
 
-The main features are:
+This project takes the approach proven by the Overwatch tactical overlays:
+draw a **separate, always-on-top transparent OS window** that the desktop
+compositor paints over the (borderless) game. Nothing is injected into the game
+process, so there's nothing for EAC to object to.
 
-- Works with arbitrary joystick like devices
-- User interface for common and some not so common configuration tasks
-- Merging of multiple physical devices into a single virtual device
-- Axis response curve and dead zone configuration
-- Mapping of joystick inputs to keyboard and mouse inputs
-- Powerful and flexible macro system
-- Arbitrary number of modes with inheritance and customizable mode switching
-- Conditional execution of configured actions
-- Python scripting support for unlimited customization
+## How it works
 
-Joystick Gremlin provides a graphical user interface which allows commonly performed tasks, such as input remapping, axis response curve setups, and macro recording to be performed easily. Functionality that is not accessible via the UI can be implemented through custom modules.
+```
+┌────────────┐   localhost UDP    ┌─────────────────────┐
+│  Mumble    │   JSON datagrams   │  Voice Overlay app  │
+│  + plugin  │ ─────────────────► │  (PyQt6, tray icon) │
+│ (observes) │   :27812           │  draws over game    │
+└────────────┘                    └─────────────────────┘
+   no drawing                        no game hooks
+```
 
-## Getting Started
+- **`plugin/`** — a tiny native Mumble plugin (C++). It uses Mumble's plugin
+  API to watch talking-state changes and gather each speaker's name, channel,
+  comment, identity hash, and mute state, then fires newline-delimited JSON over
+  localhost UDP. It never draws anything and never blocks Mumble.
+- **`overlay/`** — a PyQt6 app that listens on that port and renders a stack of
+  "speaker cards." Separate process, no injection → EAC-safe.
+- **`tools/simulator.py`** — replays a fake Mumble session so you can see and
+  position the overlay without connecting to a server.
+- **`docs/`** — the [UDP protocol](docs/PROTOCOL.md) and
+  [install guide](docs/INSTALL.md).
 
-For a list of dependencies and an overview of how to install and use Gremlin take a look at the [Manual](https://whitemagic.github.io/JoystickGremlin/).
+## What a speaker card shows
 
+Everything the Mumble plugin API exposes about a talker:
 
-## Contributing
+- **Name** (with a `(you)` tag for yourself)
+- **Talking state** — TALKING / WHISPER / SHOUT / MIC MUTED, each colour-coded,
+  with a live equaliser pulse
+- **Channel** they're speaking in
+- **Comment** (their Mumble profile note, HTML stripped)
+- **Status tags** — locally muted, self-muted, deafened
+- Stable identity (Mumble certificate **hash**) tracked under the hood
 
-If you want to contribute to Gremlin by implementing new features or fixing bugs, you will need a local development setup. The easiest way is described below.
+## Quick start
 
-### Development Setup
+```bash
+# 1. Build the plugin and install it via Mumble → Settings → Plugins
+cd plugin && cmake -S . -B build && cmake --build build
 
-The easiest way to get all the required libraries installed for Gremlin development is via a virtual environment managed by [Poetry](https://python-poetry.org). Throughout this the assumption is that [VS Code](https://code.visualstudio.com/) is used and the appropriate Python plugins are installed.
+# 2. Run the overlay (system tray app)
+cd ../overlay && python -m pip install -r requirements.txt && python -m voice_overlay
 
-### Installing Poetry
+# 3. (optional) See it without Mumble
+python tools/simulator.py
+```
 
-Abbreviated instructions from the [official documentation](https://python-poetry.org/docs/#installing-with-the-official-installer).
+Full instructions: **[docs/INSTALL.md](docs/INSTALL.md)**.
 
-- Install a Gremlin compatible version of Python, such as 3.13.x
-- Open a new Terminal / Powershell instance
-- Run the command
-  ```powershell
-  (Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | py -
-  ```
-- Add the poetry executable to your PATH setting
-  ```powershell
-  [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";C:\Users\Lionel\AppData\Roaming\Python\Scripts", "User")
-  ```
-- Launch a new Terminal / Powershell instance and check if poetry can be found by running
-  ````powershell
-  poetry --version
-  ````
-- Add the Poetry plugin (`zeshuaro.vscode-python-poetry`) to VS Code
-- Create a virtual environment and install required packages by running the `Poetry install packages` command (`Ctrl + Shift + P`) in VS Code
+## Development
 
-- Restart VS Code for the new environment to be picked up
-- Select the newly created Poetry virtual environment as the project's interpreter
+```bash
+# overlay unit tests (Qt-free, fast)
+cd overlay && python -m pytest tests/
+
+# plugin compile check
+cd plugin && cmake -S . -B build && cmake --build build
+```
+
+The protocol is intentionally additive and forgiving — unknown message types
+are ignored — so the plugin and overlay can evolve independently.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Bundles Mumble's `MumblePlugin.h`
+(`plugin/third_party/`, BSD-licensed by the Mumble developers).

@@ -71,14 +71,23 @@ static bool isActiveState(const std::string &state) {
     return state == "talking" || state == "whispering" || state == "shouting" || state == "muted";
 }
 
+// Higher priority = more "interesting" state that shouldn't be downgraded.
+static int statePriority(const std::string &state) {
+    if (state == "shouting")   return 3;
+    if (state == "whispering") return 2;
+    if (state == "muted")      return 1;
+    if (state == "talking")    return 0;
+    return -1;
+}
+
 // ---- Overlay configuration ----------------------------------------------
 
 struct OverlayConfig {
     int x = 48;
     int y = 120;
-    int width = 360;
-    int cardHeight = 64;
-    int cardSpacing = 8;
+    int width = 380;
+    int cardHeight = 56;
+    int cardSpacing = 6;
     int maxCards = 8;
     int lingerMs = 1200;
     float opacity = 0.92f;
@@ -129,7 +138,14 @@ struct PluginState {
 
     // Speaker model state
     std::vector<UserInfo> users;
-    struct TalkState { int id; std::string state; };
+    struct TalkState {
+        int id;
+        std::string state;
+        // Track the "peak" state so shout/whisper doesn't flash to talking
+        // during Mumble's hold-time wind-down.
+        std::string peakState;
+        uint32_t peakSetTick = 0;
+    };
     std::vector<TalkState> talkStates;
     bool selfMuted = false;
     bool selfDeafened = false;
@@ -172,18 +188,56 @@ static UserInfo &getOrCreateUser(int id) {
     return g.users.back();
 }
 
-static std::string getTalkState(int id) {
+static std::string getRawTalkState(int id) {
     for (auto &ts : g.talkStates) {
         if (ts.id == id) return ts.state;
     }
     return "passive";
 }
 
-static void setTalkState(int id, const std::string &state) {
+#if defined(_WIN32)
+// Returns the state to display: if a higher-priority state (shout/whisper) was
+// set recently, keep showing it instead of the "talking" that Mumble sends
+// during its hold-time wind-down.
+static std::string getDisplayTalkState(int id) {
     for (auto &ts : g.talkStates) {
-        if (ts.id == id) { ts.state = state; return; }
+        if (ts.id != id) continue;
+        if (!ts.peakState.empty() && isActiveState(ts.state)
+            && statePriority(ts.peakState) > statePriority(ts.state)) {
+            return ts.peakState;
+        }
+        return ts.state;
     }
-    g.talkStates.push_back({id, state});
+    return "passive";
+}
+#endif
+
+static void setTalkState(int id, const std::string &state) {
+#if defined(_WIN32)
+    DWORD now = GetTickCount();
+#endif
+    for (auto &ts : g.talkStates) {
+        if (ts.id == id) {
+            ts.state = state;
+            if (!isActiveState(state)) {
+                ts.peakState.clear();
+            } else if (statePriority(state) >= statePriority(ts.peakState)) {
+                ts.peakState = state;
+#if defined(_WIN32)
+                ts.peakSetTick = now;
+#endif
+            }
+            return;
+        }
+    }
+    PluginState::TalkState newTs;
+    newTs.id = id;
+    newTs.state = state;
+    newTs.peakState = isActiveState(state) ? state : "";
+#if defined(_WIN32)
+    newTs.peakSetTick = now;
+#endif
+    g.talkStates.push_back(newTs);
 }
 
 static void removeUser(int id) {
@@ -205,7 +259,7 @@ static std::vector<ActiveSpeaker> buildSnapshot() {
         auto *u = findUser(ts.id);
         ActiveSpeaker sp;
         sp.user = u ? *u : UserInfo{ts.id, "User " + std::to_string(ts.id), {}, -1, {}, {}, false, false};
-        sp.state = ts.state;
+        sp.state = getDisplayTalkState(ts.id);
         sp.isSelf = isSelf || sp.user.isSelf;
         sp.selfMuted = g.selfMuted;
         sp.selfDeafened = g.selfDeafened;
@@ -486,46 +540,39 @@ static void paintOverlay(HWND hwnd) {
             if (sp.isSelf) nameW += L"  (you)";
 
             Gdiplus::FontFamily fontFamily(L"Segoe UI");
-            Gdiplus::Font nameFont(&fontFamily, 13.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-            Gdiplus::SolidBrush nameBrush(Gdiplus::Color(static_cast<BYTE>(240 * op), 230, 237, 243));
+            Gdiplus::Font nameFont(&fontFamily, 11.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+            Gdiplus::SolidBrush nameBrush(Gdiplus::Color(static_cast<BYTE>(245 * op), 230, 237, 243));
             Gdiplus::PointF namePos(14.0f, static_cast<float>(yOff) + 8.0f);
-            graphics.DrawString(nameW.c_str(), -1, &nameFont, namePos, &nameBrush);
+            Gdiplus::StringFormat nameFmt;
+            nameFmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            Gdiplus::RectF nameRect(14.0f, static_cast<float>(yOff) + 8.0f,
+                                    static_cast<float>(w) - 30.0f, 20.0f);
+            graphics.DrawString(nameW.c_str(), -1, &nameFont, nameRect, &nameFmt, &nameBrush);
         }
 
-        // Meta line: STATE · channel · status tags
+        // Meta line: STATE  ·  channel  ·  status tags
         {
             std::wstring meta(theme.label);
             if (g.config.showChannel && !sp.user.channel.empty()) {
-                meta += L"  ·  ";
+                meta += L"  \x00B7  ";
                 meta += toWide(sp.user.channel);
             }
             if (sp.user.locallyMuted) {
-                meta += L"  ·  LOCAL MUTED";
+                meta += L"  \x00B7  LOCAL MUTED";
             }
             if (sp.isSelf) {
-                if (sp.selfDeafened) meta += L"  ·  DEAFENED";
-                else if (sp.selfMuted) meta += L"  ·  SELF MUTED";
+                if (sp.selfDeafened) meta += L"  \x00B7  DEAFENED";
+                else if (sp.selfMuted) meta += L"  \x00B7  SELF MUTED";
             }
 
             Gdiplus::FontFamily monoFamily(L"Consolas");
-            Gdiplus::Font metaFont(&monoFamily, 10.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+            Gdiplus::Font metaFont(&monoFamily, 8.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
             Gdiplus::SolidBrush metaBrush(Gdiplus::Color(static_cast<BYTE>(220 * op), accentR, accentG, accentB));
-            Gdiplus::PointF metaPos(14.0f, static_cast<float>(yOff) + 28.0f);
-            graphics.DrawString(meta.c_str(), -1, &metaFont, metaPos, &metaBrush);
-        }
-
-        // Comment (if present, truncated)
-        {
-            std::string comment = stripHtml(sp.user.comment);
-            if (!comment.empty()) {
-                if (comment.size() > 90) comment = comment.substr(0, 90) + "...";
-                std::wstring commentW = L"“" + toWide(comment) + L"”";
-                Gdiplus::FontFamily fontFamily(L"Segoe UI");
-                Gdiplus::Font commentFont(&fontFamily, 10.0f, Gdiplus::FontStyleItalic, Gdiplus::UnitPixel);
-                Gdiplus::SolidBrush commentBrush(Gdiplus::Color(static_cast<BYTE>(180 * op), 107, 114, 128));
-                Gdiplus::PointF commentPos(14.0f, static_cast<float>(yOff) + 44.0f);
-                graphics.DrawString(commentW.c_str(), -1, &commentFont, commentPos, &commentBrush);
-            }
+            Gdiplus::RectF metaRect(14.0f, static_cast<float>(yOff) + 30.0f,
+                                    static_cast<float>(w) - 30.0f, 16.0f);
+            Gdiplus::StringFormat metaFmt;
+            metaFmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            graphics.DrawString(meta.c_str(), -1, &metaFont, metaRect, &metaFmt, &metaBrush);
         }
 
         yOff += cardH + spacing;
@@ -741,7 +788,7 @@ static void recordTalk(mumble_userid_t user, mumble_talking_state_t state) {
     std::string stateName = talkingStateName(state);
     {
         std::lock_guard<std::mutex> lock(g.mutex);
-        std::string prev = getTalkState(static_cast<int>(user));
+        std::string prev = getRawTalkState(static_cast<int>(user));
         setTalkState(static_cast<int>(user), stateName);
 
         // If transitioning from active to passive, start linger

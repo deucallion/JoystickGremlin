@@ -1,17 +1,10 @@
-# Install & run
+# Install
 
-Two pieces work together:
-
-1. **The Mumble plugin** (`plugin/`) — a small native library Mumble loads. It
-   observes who is talking and streams it over localhost UDP. It draws nothing.
-2. **The overlay** (`overlay/`) — a Python app that listens and draws the
-   always-on-top window over your game.
-
-You need both running.
+One DLL — that's it.
 
 ---
 
-## 1. Build & install the Mumble plugin
+## Build the plugin
 
 ### Build (Windows, recommended for Star Citizen players)
 
@@ -25,6 +18,14 @@ cmake --build build --config Release
 
 This produces `plugin\build\Release\mumble_voice_overlay.dll`.
 
+Or use the shortcut from the repo root:
+
+```powershell
+.\build.ps1
+```
+
+This builds the DLL and copies it to your Desktop.
+
 ### Build (Linux/macOS, for development)
 
 ```bash
@@ -34,7 +35,12 @@ cmake --build build
 # -> build/mumble_voice_overlay.so (.dylib on macOS)
 ```
 
-### Install into Mumble
+The overlay rendering is Windows-only (Win32 + GDI+). On Linux/macOS the
+plugin compiles cleanly for CI but the overlay is a no-op.
+
+---
+
+## Install into Mumble
 
 1. Open Mumble → **Configure → Settings → Plugins**.
 2. Click **Install plugin…** and pick the built `mumble_voice_overlay.dll`.
@@ -49,47 +55,11 @@ Mumble ≥ 1.4 is required (the plugin uses the v1.0 plugin API).
 
 ---
 
-## 2. Run the overlay
+## Usage
 
-Requires Python 3.10+.
+The overlay appears automatically whenever someone in your channel talks.
+Speaker cards stack in the top-left corner of your screen (configurable by
+position constants in the source). When locked (the default), the overlay is
+fully click-through so it never steals game input.
 
-```bash
-cd overlay
-python -m pip install -r requirements.txt
-python -m voice_overlay
-```
-
-A microphone icon appears in your system tray. Right-click it to:
-
-- **Unlock (move/resize)** — show a draggable frame so you can position the
-  overlay, then lock it again to make it click-through.
-- **Show my own card** — toggle whether your own voice shows a card.
-- **Quit**.
-
-When locked (the default) the overlay is invisible and click-through until
-someone talks, then speaker cards fade in over your game.
-
-### Try it without Mumble
-
-To position the overlay or just see it work, replay a fake session:
-
-```bash
-cd overlay
-python tools/simulator.py
-```
-
----
-
-## Configuration
-
-Settings live in a JSON file you can hand-edit:
-
-- Windows: `%APPDATA%\MumbleVoiceOverlay\config.json`
-- Linux/macOS: `~/.config/MumbleVoiceOverlay/config.json`
-
-Key fields: `port`, `overlay_x`/`overlay_y`/`overlay_width`, `opacity`,
-`accent_color`, `linger_ms`, `max_cards`, `show_channel`, `show_comment`,
-`show_self`. See [PROTOCOL.md](PROTOCOL.md) for the data the overlay receives.
-
-If you change the port, set the same value for Mumble by launching it with the
-`MUMBLE_VOICE_OVERLAY_PORT` environment variable set.
+No separate overlay application is needed. No Python. No extra downloads.

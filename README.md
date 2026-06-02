@@ -1,8 +1,9 @@
 # Mumble Voice Overlay (Star Citizen)
 
-An **EAC-safe voice overlay for Mumble**. It shows who is currently talking —
-and as much as Mumble knows about them — in an always-on-top window over your
-game.
+A **self-contained, EAC-safe voice overlay for Mumble**. Install one plugin DLL
+into Mumble and it shows who is currently talking in an always-on-top window
+over your game. No separate overlay app to download, no Python, no extra
+processes.
 
 ## Why this exists
 
@@ -11,7 +12,7 @@ rendering pipeline** (hooking OpenGL/Direct3D). Anti-cheat systems like Star
 Citizen's **Easy Anti-Cheat (EAC)** treat that injection as tampering, so the
 Mumble overlay simply doesn't show — and at worst trips anti-cheat.
 
-This project takes the approach proven by the Overwatch tactical overlays:
+This plugin takes the approach proven by the Overwatch tactical overlays:
 draw a **separate, always-on-top transparent OS window** that the desktop
 compositor paints over the (borderless) game. Nothing is injected into the game
 process, so there's nothing for EAC to object to.
@@ -19,66 +20,53 @@ process, so there's nothing for EAC to object to.
 ## How it works
 
 ```
-┌────────────┐   localhost UDP    ┌─────────────────────┐
-│  Mumble    │   JSON datagrams   │  Voice Overlay app  │
-│  + plugin  │ ─────────────────► │  (PyQt6, tray icon) │
-│ (observes) │   :27812           │  draws over game    │
-└────────────┘                    └─────────────────────┘
-   no drawing                        no game hooks
+┌────────────────────────────────────────────────┐
+│  Mumble + plugin DLL                           │
+│                                                │
+│  observes talking state  ──►  renders overlay  │
+│  (Mumble plugin API)        (Win32 + GDI+)     │
+│                                                │
+│  No game hooks. No injection. No extra process.│
+└────────────────────────────────────────────────┘
 ```
 
-- **`plugin/`** — a tiny native Mumble plugin (C++). It uses Mumble's plugin
-  API to watch talking-state changes and gather each speaker's name, channel,
-  comment, identity hash, and mute state, then fires newline-delimited JSON over
-  localhost UDP. It never draws anything and never blocks Mumble.
-- **`overlay/`** — a PyQt6 app that listens on that port and renders a stack of
-  "speaker cards." Separate process, no injection → EAC-safe.
-- **`tools/simulator.py`** — replays a fake Mumble session so you can see and
-  position the overlay without connecting to a server.
-- **`docs/`** — the [UDP protocol](docs/PROTOCOL.md) and
-  [install guide](docs/INSTALL.md).
+Everything is in one DLL:
+- **Observes** Mumble's talking state, channel roster, user details via the
+  plugin API
+- **Renders** speaker cards in a transparent always-on-top window using Win32
+  layered windows and GDI+
+- **No separate process** — the overlay runs on a background thread inside the
+  plugin
 
 ## What a speaker card shows
 
 Everything the Mumble plugin API exposes about a talker:
 
 - **Name** (with a `(you)` tag for yourself)
-- **Talking state** — TALKING / WHISPER / SHOUT / MIC MUTED, each colour-coded,
-  with a live equaliser pulse
+- **Talking state** — TALKING / WHISPER / SHOUT / MIC MUTED, each colour-coded
 - **Channel** they're speaking in
 - **Comment** (their Mumble profile note, HTML stripped)
 - **Status tags** — locally muted, self-muted, deafened
-- Stable identity (Mumble certificate **hash**) tracked under the hood
 
 ## Quick start
 
 ```bash
-# 1. Build the plugin and install it via Mumble → Settings → Plugins
+# Build the plugin DLL
 cd plugin && cmake -S . -B build && cmake --build build
+
 # Windows shortcut: from the repo root, run  .\build.ps1
 # (builds the DLL and copies it to your Desktop)
-
-# 2. Run the overlay (system tray app)
-cd ../overlay && python -m pip install -r requirements.txt && python -m voice_overlay
-
-# 3. (optional) See it without Mumble
-python tools/simulator.py
 ```
 
-Full instructions: **[docs/INSTALL.md](docs/INSTALL.md)**.
+Then install the DLL via **Mumble → Settings → Plugins → Install plugin**.
+That's it — the overlay appears automatically when someone talks.
 
 ## Development
 
 ```bash
-# overlay unit tests (Qt-free, fast)
-cd overlay && python -m pytest tests/
-
-# plugin compile check
+# plugin compile check (works on Linux/macOS too, overlay is a no-op stub)
 cd plugin && cmake -S . -B build && cmake --build build
 ```
-
-The protocol is intentionally additive and forgiving — unknown message types
-are ignored — so the plugin and overlay can evolve independently.
 
 ## License
 

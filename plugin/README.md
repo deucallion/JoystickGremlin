@@ -1,9 +1,8 @@
-# Mumble Voice Overlay — native plugin
+# Mumble Voice Overlay — self-contained plugin
 
-A general-purpose [Mumble plugin](https://www.mumble.info/documentation/developer/positional-audio/create-plugin/)
-that streams talking-state and user info to the out-of-process overlay over
-localhost UDP. It implements only the observing half of Mumble's plugin API and
-draws nothing.
+A [Mumble plugin](https://www.mumble.info/documentation/developer/positional-audio/create-plugin/)
+that observes who is talking and renders an always-on-top overlay window
+directly. One DLL, no separate overlay process, no Python, no extra downloads.
 
 ## Layout
 
@@ -22,18 +21,19 @@ cmake --build build --config Release
 Output: `mumble_voice_overlay.dll` (Windows) / `.so` (Linux) / `.dylib` (macOS).
 Install it via **Mumble → Settings → Plugins → Install plugin…**.
 
+On Linux/macOS the plugin compiles cleanly for CI but the overlay rendering is
+a no-op (it uses Win32 + GDI+).
+
 ## Design notes
 
 - **API version 1.0.0.** Every getter used here is part of the original plugin
   API, and the API struct is append-only, so the plugin loads on the widest
   range of Mumble releases (1.4.0+).
-- **Never blocks Mumble.** The UDP socket is non-blocking and all send errors
-  are ignored — if the overlay isn't running, datagrams are simply dropped.
-- **Thread-safe.** `onServerConnected`/`onServerDisconnected` run on a different
-  thread from the talking/channel callbacks; shared state is guarded by a mutex,
-  and API getters are only called from the main-thread callbacks where they're
-  valid.
+- **Overlay on a background thread.** The overlay window runs its own Win32
+  message loop on a dedicated thread so it never blocks Mumble's UI.
+- **Thread-safe.** Speaker state is guarded by a mutex. Mumble callbacks update
+  the model and post a repaint message to the overlay thread.
 - **No leaks.** Every string/array the API allocates is released via
   `api.freeMemory` immediately after copying it.
-
-See [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md) for the message format.
+- **EAC-safe.** The overlay is an ordinary top-level OS window — no game process
+  injection, no D3D/OpenGL hooking.

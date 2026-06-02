@@ -21,7 +21,7 @@ set_target_properties(mumble_voice_overlay PROPERTIES
     PREFIX "")
 
 if(WIN32)
-    target_link_libraries(mumble_voice_overlay PRIVATE Ws2_32)
+    target_link_libraries(mumble_voice_overlay PRIVATE Gdiplus)
 endif()
 
 if(MSVC)

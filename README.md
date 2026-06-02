@@ -55,6 +55,8 @@ Everything the Mumble plugin API exposes about a talker:
 ```bash
 # 1. Build the plugin and install it via Mumble → Settings → Plugins
 cd plugin && cmake -S . -B build && cmake --build build
+# Windows shortcut: from the repo root, run  .\build.ps1
+# (builds the DLL and copies it to your Desktop)
 
 # 2. Run the overlay (system tray app)
 cd ../overlay && python -m pip install -r requirements.txt && python -m voice_overlay

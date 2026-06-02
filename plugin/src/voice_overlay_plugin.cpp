@@ -1,14 +1,11 @@
 // Mumble Voice Overlay -- self-contained native Mumble plugin.
 //
-// This plugin observes Mumble (who is talking, who is in your channel, what
-// Mumble knows about them) and renders an always-on-top transparent overlay
-// window directly, using the Win32 API and GDI+. Nothing is injected into the
-// game process -- the overlay is an ordinary OS window the desktop compositor
-// draws over the game -- so anti-cheat systems like EAC have nothing to object
-// to.
+// Observes Mumble talking state and renders an always-on-top transparent
+// overlay window using Win32 layered windows + GDI+. Nothing injected into
+// the game process, so EAC has nothing to object to.
 //
-// No separate overlay application is needed. Install this single DLL into
-// Mumble and you're done.
+// Settings: %APPDATA%\MumbleVoiceOverlay\config.json
+// Right-click the tray icon to lock/unlock, reload config, etc.
 
 #include "MumblePlugin.h"
 
@@ -25,28 +22,27 @@
 
 #if defined(_WIN32)
 
-#define NOMINMAX  // prevent windows.h from defining min/max macros
+#define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
 #pragma comment(lib, "Gdiplus.lib")
+#pragma comment(lib, "Shell32.lib")
 
-#else
-// On non-Windows platforms the overlay rendering is a no-op stub. The plugin
-// still compiles for CI / link-checking but won't display anything. A future
-// version could add X11/Wayland rendering here.
 #endif
 
 namespace {
 
-// ---- Plugin identity ----------------------------------------------------
+// ---- Plugin identity -------------------------------------------------------
 
-constexpr const char *PLUGIN_NAME    = "Mumble Voice Overlay (Star Citizen)";
-constexpr const char *PLUGIN_AUTHOR  = "Mumble Voice Overlay";
-constexpr const char *PLUGIN_DESC    = "Self-contained EAC-safe voice overlay. Shows who is talking in an always-on-top window over your game.";
-constexpr int PROTOCOL_VERSION       = 1;
+constexpr const char *PLUGIN_NAME   = "Mumble Voice Overlay (Star Citizen)";
+constexpr const char *PLUGIN_AUTHOR = "Mumble Voice Overlay";
+constexpr const char *PLUGIN_DESC   =
+    "Self-contained EAC-safe voice overlay. Shows who is talking in an "
+    "always-on-top window. Right-click the tray icon to configure.";
 
-// ---- Speaker model (replaces the Python protocol.py) --------------------
+// ---- Speaker model ---------------------------------------------------------
 
 struct UserInfo {
     int id = 0;
@@ -61,49 +57,170 @@ struct UserInfo {
 
 struct ActiveSpeaker {
     UserInfo user;
-    std::string state;        // "talking", "whispering", "shouting", "muted"
+    std::string state;
     bool isSelf = false;
     bool selfMuted = false;
     bool selfDeafened = false;
 };
 
-static bool isActiveState(const std::string &state) {
-    return state == "talking" || state == "whispering" || state == "shouting" || state == "muted";
+static bool isActiveState(const std::string &s) {
+    return s == "talking" || s == "whispering" || s == "shouting" || s == "muted";
 }
 
-// Higher priority = more "interesting" state that shouldn't be downgraded.
-static int statePriority(const std::string &state) {
-    if (state == "shouting")   return 3;
-    if (state == "whispering") return 2;
-    if (state == "muted")      return 1;
-    if (state == "talking")    return 0;
+static int statePriority(const std::string &s) {
+    if (s == "shouting")   return 3;
+    if (s == "whispering") return 2;
+    if (s == "muted")      return 1;
+    if (s == "talking")    return 0;
     return -1;
 }
 
-// ---- Overlay configuration ----------------------------------------------
+// ---- Configuration (persisted to config.json) ------------------------------
+//
+// Edit %APPDATA%\MumbleVoiceOverlay\config.json while Mumble is running,
+// then right-click the tray icon → Reload config.
 
 struct OverlayConfig {
-    int x = 48;
-    int y = 120;
-    int width = 380;
-    int cardHeight = 56;
-    int cardSpacing = 6;
-    int maxCards = 8;
-    int lingerMs = 1200;
-    float opacity = 0.92f;
-    bool showSelf = true;
-    bool showChannel = true;
-    bool locked = true;
+    // Position & size
+    int   x           = 48;    // screen X of overlay top-left
+    int   y           = 120;   // screen Y of overlay top-left
+    int   width       = 380;   // card width in pixels
+    int   cardHeight  = 72;    // height of each speaker card in pixels
+    int   cardSpacing = 6;     // gap between cards in pixels
+
+    // Text
+    float nameFontPt  = 15.0f; // speaker name font size (points)
+    float metaFontPt  = 10.0f; // state/channel line font size (points)
+
+    // Appearance
+    float opacity     = 0.92f; // 0.0–1.0
+    int   lingerMs    = 1200;  // how long a card stays after talking stops (ms)
+
+    // Behaviour
+    int   maxCards    = 8;
+    bool  showSelf    = true;  // show your own card when you talk
+    bool  showChannel = true;  // show channel name on each card
 };
 
-// ---- Color theme per talking state (Windows only) -----------------------
+// ---- Config file (Windows-only, plain Win32, no extra libs) ----------------
 
 #if defined(_WIN32)
 
-struct StateTheme {
-    DWORD accent;     // ARGB
-    const wchar_t *label;
-};
+static std::wstring configDir() {
+    wchar_t buf[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
+    return std::wstring(buf) + L"\\MumbleVoiceOverlay";
+}
+
+static std::wstring configPath() {
+    return configDir() + L"\\config.json";
+}
+
+static std::string readFileW(const std::wstring &path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    DWORD sz = GetFileSize(h, nullptr);
+    if (!sz || sz == INVALID_FILE_SIZE) { CloseHandle(h); return {}; }
+    std::string buf(sz, '\0');
+    DWORD rd = 0;
+    ReadFile(h, &buf[0], sz, &rd, nullptr);
+    CloseHandle(h);
+    buf.resize(rd);
+    return buf;
+}
+
+static void writeFileW(const std::wstring &path, const std::string &text) {
+    CreateDirectoryW(configDir().c_str(), nullptr);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr);
+    CloseHandle(h);
+}
+
+// Minimal JSON key-value reader — handles numbers, booleans.
+static bool jsonFind(const std::string &json, const std::string &key, std::string &out) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
+    if (p >= json.size() || json[p] != ':') return false;
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
+    if (p >= json.size()) return false;
+    size_t e = p;
+    while (e < json.size() && json[e] != ',' && json[e] != '}' && json[e] != '\n' && json[e] != '\r') ++e;
+    out = json.substr(p, e - p);
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
+    return !out.empty();
+}
+
+static int jsonInt(const std::string &j, const std::string &k, int def) {
+    std::string v; if (!jsonFind(j, k, v)) return def;
+    try { return std::stoi(v); } catch (...) { return def; }
+}
+static float jsonFloat(const std::string &j, const std::string &k, float def) {
+    std::string v; if (!jsonFind(j, k, v)) return def;
+    try { return std::stof(v); } catch (...) { return def; }
+}
+static bool jsonBool(const std::string &j, const std::string &k, bool def) {
+    std::string v; if (!jsonFind(j, k, v)) return def;
+    return v == "true" ? true : (v == "false" ? false : def);
+}
+
+static OverlayConfig loadConfig() {
+    OverlayConfig c;
+    std::string json = readFileW(configPath());
+    if (json.empty()) return c;
+    c.x           = jsonInt  (json, "x",           c.x);
+    c.y           = jsonInt  (json, "y",           c.y);
+    c.width       = jsonInt  (json, "width",       c.width);
+    c.cardHeight  = jsonInt  (json, "cardHeight",  c.cardHeight);
+    c.cardSpacing = jsonInt  (json, "cardSpacing", c.cardSpacing);
+    c.nameFontPt  = jsonFloat(json, "nameFontPt",  c.nameFontPt);
+    c.metaFontPt  = jsonFloat(json, "metaFontPt",  c.metaFontPt);
+    c.opacity     = jsonFloat(json, "opacity",     c.opacity);
+    c.lingerMs    = jsonInt  (json, "lingerMs",    c.lingerMs);
+    c.maxCards    = jsonInt  (json, "maxCards",    c.maxCards);
+    c.showSelf    = jsonBool (json, "showSelf",    c.showSelf);
+    c.showChannel = jsonBool (json, "showChannel", c.showChannel);
+    return c;
+}
+
+static void saveConfig(const OverlayConfig &c) {
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+        "{\n"
+        "  \"x\":           %d,\n"
+        "  \"y\":           %d,\n"
+        "  \"width\":       %d,\n"
+        "  \"cardHeight\":  %d,\n"
+        "  \"cardSpacing\": %d,\n"
+        "  \"nameFontPt\":  %.1f,\n"
+        "  \"metaFontPt\":  %.1f,\n"
+        "  \"opacity\":     %.2f,\n"
+        "  \"lingerMs\":    %d,\n"
+        "  \"maxCards\":    %d,\n"
+        "  \"showSelf\":    %s,\n"
+        "  \"showChannel\": %s\n"
+        "}\n",
+        c.x, c.y, c.width, c.cardHeight, c.cardSpacing,
+        c.nameFontPt, c.metaFontPt, c.opacity, c.lingerMs, c.maxCards,
+        c.showSelf    ? "true" : "false",
+        c.showChannel ? "true" : "false");
+    writeFileW(configPath(), buf);
+}
+
+#endif // _WIN32
+
+// ---- Color theme per talking state -----------------------------------------
+
+#if defined(_WIN32)
+
+struct StateTheme { DWORD accent; const wchar_t *label; };
 
 static StateTheme themeForState(const std::string &state) {
     if (state == "talking")    return { 0xFF00E5FF, L"TALKING" };
@@ -113,16 +230,11 @@ static StateTheme themeForState(const std::string &state) {
     return { 0xFF00E5FF, L"TALKING" };
 }
 
-// ---- Linger tracking (keep card visible briefly after silence) -----------
+struct LingerEntry { int userId; DWORD expireTickMs; };
 
-struct LingerEntry {
-    int userId;
-    DWORD expireTickMs;
-};
+#endif
 
-#endif // _WIN32
-
-// ---- Global state -------------------------------------------------------
+// ---- Global state ----------------------------------------------------------
 
 struct PluginState {
     std::mutex mutex;
@@ -133,24 +245,20 @@ struct PluginState {
     mumble_connection_t connection = -1;
     mumble_userid_t localUser = 0;
     bool synchronized = false;
-
     std::vector<mumble_userid_t> known;
 
-    // Speaker model state
+    // Speaker model
     std::vector<UserInfo> users;
     struct TalkState {
         int id;
         std::string state;
-        // Track the "peak" state so shout/whisper doesn't flash to talking
-        // during Mumble's hold-time wind-down.
-        std::string peakState;
+        std::string peakState;  // highest-priority state seen this activation
         uint32_t peakSetTick = 0;
     };
     std::vector<TalkState> talkStates;
     bool selfMuted = false;
     bool selfDeafened = false;
 
-    // Overlay
     OverlayConfig config;
 
 #if defined(_WIN32)
@@ -159,53 +267,46 @@ struct PluginState {
     bool overlayRunning = false;
     ULONG_PTR gdiplusToken = 0;
 
-    // Linger
     std::vector<LingerEntry> linger;
     UINT_PTR lingerTimerId = 0;
 
-    // Drag state
-    bool dragging = false;
-    POINT dragOffset = {};
+    NOTIFYICONDATAW trayData = {};
+    bool trayAdded = false;
+    UINT wmTaskbarCreated = 0;
 #endif
 };
 
 PluginState g;
 
-// ---- UserInfo helpers ---------------------------------------------------
+// ---- Speaker model helpers -------------------------------------------------
 
 static UserInfo *findUser(int id) {
-    for (auto &u : g.users) {
-        if (u.id == id) return &u;
-    }
+    for (auto &u : g.users) { if (u.id == id) return &u; }
     return nullptr;
 }
 
 static UserInfo &getOrCreateUser(int id) {
     if (auto *u = findUser(id)) return *u;
     g.users.push_back({});
-    g.users.back().id = id;
+    g.users.back().id   = id;
     g.users.back().name = "User " + std::to_string(id);
     return g.users.back();
 }
 
 static std::string getRawTalkState(int id) {
-    for (auto &ts : g.talkStates) {
-        if (ts.id == id) return ts.state;
-    }
+    for (auto &ts : g.talkStates) { if (ts.id == id) return ts.state; }
     return "passive";
 }
 
 #if defined(_WIN32)
-// Returns the state to display: if a higher-priority state (shout/whisper) was
-// set recently, keep showing it instead of the "talking" that Mumble sends
-// during its hold-time wind-down.
+// While a user is actively talking, show their peak state (e.g. SHOUT stays
+// visible even if Mumble briefly reports TALKING during hold-time wind-down).
 static std::string getDisplayTalkState(int id) {
     for (auto &ts : g.talkStates) {
         if (ts.id != id) continue;
         if (!ts.peakState.empty() && isActiveState(ts.state)
-            && statePriority(ts.peakState) > statePriority(ts.state)) {
+                && statePriority(ts.peakState) > statePriority(ts.state))
             return ts.peakState;
-        }
         return ts.state;
     }
     return "passive";
@@ -217,27 +318,26 @@ static void setTalkState(int id, const std::string &state) {
     DWORD now = GetTickCount();
 #endif
     for (auto &ts : g.talkStates) {
-        if (ts.id == id) {
-            ts.state = state;
-            if (!isActiveState(state)) {
-                ts.peakState.clear();
-            } else if (statePriority(state) >= statePriority(ts.peakState)) {
-                ts.peakState = state;
+        if (ts.id != id) continue;
+        ts.state = state;
+        if (!isActiveState(state)) {
+            ts.peakState.clear();
+        } else if (statePriority(state) >= statePriority(ts.peakState)) {
+            ts.peakState = state;
 #if defined(_WIN32)
-                ts.peakSetTick = now;
+            ts.peakSetTick = now;
 #endif
-            }
-            return;
         }
+        return;
     }
-    PluginState::TalkState newTs;
-    newTs.id = id;
-    newTs.state = state;
-    newTs.peakState = isActiveState(state) ? state : "";
+    PluginState::TalkState n;
+    n.id        = id;
+    n.state     = state;
+    n.peakState = isActiveState(state) ? state : "";
 #if defined(_WIN32)
-    newTs.peakSetTick = now;
+    n.peakSetTick = now;
 #endif
-    g.talkStates.push_back(newTs);
+    g.talkStates.push_back(n);
 }
 
 static void removeUser(int id) {
@@ -248,20 +348,18 @@ static void removeUser(int id) {
 }
 
 #if defined(_WIN32)
-// Build the current list of active speakers (sorted: self last, then by name).
 static std::vector<ActiveSpeaker> buildSnapshot() {
     std::vector<ActiveSpeaker> result;
     for (auto &ts : g.talkStates) {
         if (!isActiveState(ts.state)) continue;
         bool isSelf = (ts.id == static_cast<int>(g.localUser));
         if (!g.config.showSelf && isSelf) continue;
-
         auto *u = findUser(ts.id);
         ActiveSpeaker sp;
         sp.user = u ? *u : UserInfo{ts.id, "User " + std::to_string(ts.id), {}, -1, {}, {}, false, false};
-        sp.state = getDisplayTalkState(ts.id);
-        sp.isSelf = isSelf || sp.user.isSelf;
-        sp.selfMuted = g.selfMuted;
+        sp.state        = getDisplayTalkState(ts.id);
+        sp.isSelf       = isSelf || sp.user.isSelf;
+        sp.selfMuted    = g.selfMuted;
         sp.selfDeafened = g.selfDeafened;
         result.push_back(sp);
     }
@@ -273,90 +371,68 @@ static std::vector<ActiveSpeaker> buildSnapshot() {
         result.resize(g.config.maxCards);
     return result;
 }
-#endif // _WIN32
+#endif
 
-// ---- Mumble API convenience wrappers -----------------------------------
+// ---- Mumble API wrappers ---------------------------------------------------
 
-bool apiReady() {
-    return g.apiValid && g.id != 0;
-}
+static bool apiReady() { return g.apiValid && g.id != 0; }
 
-std::string userName(mumble_connection_t connection, mumble_userid_t user) {
-    std::string result;
-    if (!g.api.getUserName) return result;
+static std::string userName(mumble_connection_t c, mumble_userid_t u) {
+    std::string r; if (!g.api.getUserName) return r;
     const char *raw = nullptr;
-    if (g.api.getUserName(g.id, connection, user, &raw) == MUMBLE_EC_OK && raw) {
-        result = raw;
-        g.api.freeMemory(g.id, raw);
-    }
-    return result;
+    if (g.api.getUserName(g.id, c, u, &raw) == MUMBLE_EC_OK && raw) { r = raw; g.api.freeMemory(g.id, raw); }
+    return r;
 }
-
-std::string userComment(mumble_connection_t connection, mumble_userid_t user) {
-    std::string result;
-    if (!g.api.getUserComment) return result;
+static std::string userComment(mumble_connection_t c, mumble_userid_t u) {
+    std::string r; if (!g.api.getUserComment) return r;
     const char *raw = nullptr;
-    if (g.api.getUserComment(g.id, connection, user, &raw) == MUMBLE_EC_OK && raw) {
-        result = raw;
-        g.api.freeMemory(g.id, raw);
-    }
-    return result;
+    if (g.api.getUserComment(g.id, c, u, &raw) == MUMBLE_EC_OK && raw) { r = raw; g.api.freeMemory(g.id, raw); }
+    return r;
 }
-
-std::string userHash(mumble_connection_t connection, mumble_userid_t user) {
-    std::string result;
-    if (!g.api.getUserHash) return result;
+static std::string userHash(mumble_connection_t c, mumble_userid_t u) {
+    std::string r; if (!g.api.getUserHash) return r;
     const char *raw = nullptr;
-    if (g.api.getUserHash(g.id, connection, user, &raw) == MUMBLE_EC_OK && raw) {
-        result = raw;
-        g.api.freeMemory(g.id, raw);
-    }
-    return result;
+    if (g.api.getUserHash(g.id, c, u, &raw) == MUMBLE_EC_OK && raw) { r = raw; g.api.freeMemory(g.id, raw); }
+    return r;
 }
-
-std::string channelNameOfUser(mumble_connection_t connection, mumble_userid_t user, mumble_channelid_t *outId) {
-    std::string result;
-    if (!g.api.getChannelOfUser || !g.api.getChannelName) return result;
-    mumble_channelid_t channel = -1;
-    if (g.api.getChannelOfUser(g.id, connection, user, &channel) != MUMBLE_EC_OK) return result;
-    if (outId) *outId = channel;
+static std::string channelNameOfUser(mumble_connection_t c, mumble_userid_t u, mumble_channelid_t *outId) {
+    std::string r;
+    if (!g.api.getChannelOfUser || !g.api.getChannelName) return r;
+    mumble_channelid_t ch = -1;
+    if (g.api.getChannelOfUser(g.id, c, u, &ch) != MUMBLE_EC_OK) return r;
+    if (outId) *outId = ch;
     const char *raw = nullptr;
-    if (g.api.getChannelName(g.id, connection, channel, &raw) == MUMBLE_EC_OK && raw) {
-        result = raw;
-        g.api.freeMemory(g.id, raw);
-    }
-    return result;
+    if (g.api.getChannelName(g.id, c, ch, &raw) == MUMBLE_EC_OK && raw) { r = raw; g.api.freeMemory(g.id, raw); }
+    return r;
 }
-
-bool userLocallyMuted(mumble_connection_t connection, mumble_userid_t user) {
+static bool userLocallyMuted(mumble_connection_t c, mumble_userid_t u) {
     if (!g.api.isUserLocallyMuted) return false;
-    bool muted = false;
-    g.api.isUserLocallyMuted(g.id, connection, user, &muted);
-    return muted;
+    bool m = false; g.api.isUserLocallyMuted(g.id, c, u, &m); return m;
 }
-
-const char *talkingStateName(mumble_talking_state_t state) {
-    switch (state) {
-        case MUMBLE_TS_PASSIVE: return "passive";
-        case MUMBLE_TS_TALKING: return "talking";
-        case MUMBLE_TS_WHISPERING: return "whispering";
-        case MUMBLE_TS_SHOUTING: return "shouting";
+static const char *talkingStateName(mumble_talking_state_t s) {
+    switch (s) {
+        case MUMBLE_TS_PASSIVE:       return "passive";
+        case MUMBLE_TS_TALKING:       return "talking";
+        case MUMBLE_TS_WHISPERING:    return "whispering";
+        case MUMBLE_TS_SHOUTING:      return "shouting";
         case MUMBLE_TS_TALKING_MUTED: return "muted";
-        default: return "invalid";
+        default:                       return "invalid";
     }
 }
-
-bool isKnown(mumble_userid_t user) {
-    std::lock_guard<std::mutex> lock(g.mutex);
-    for (mumble_userid_t u : g.known) {
-        if (u == user) return true;
-    }
+static bool isKnown(mumble_userid_t u) {
+    std::lock_guard<std::mutex> lk(g.mutex);
+    for (auto id : g.known) { if (id == u) return true; }
     return false;
 }
 
-// ---- Overlay rendering (Win32 + GDI+) -----------------------------------
+// ---- Win32 overlay ---------------------------------------------------------
 
 #if defined(_WIN32)
+
+// Menu command IDs
+enum { CMD_SHOWSELF = 1001, CMD_SHOWCHANNEL, CMD_RELOAD, CMD_OPENCONFIG, CMD_CLOSE };
+// Custom window messages
+enum { WM_REPAINT = WM_USER + 1, WM_TRAY = WM_USER + 2, WM_RELOAD = WM_USER + 3 };
 
 static std::wstring toWide(const std::string &s) {
     if (s.empty()) return {};
@@ -368,250 +444,202 @@ static std::wstring toWide(const std::string &s) {
     return ws;
 }
 
-// Strip HTML tags from Mumble comments (simplified version of Python strip_html).
 static std::string stripHtml(const std::string &html) {
-    std::string out;
-    out.reserve(html.size());
-    bool inTag = false;
+    std::string out; bool inTag = false;
     for (char c : html) {
         if (c == '<') { inTag = true; continue; }
         if (c == '>') { inTag = false; out.push_back(' '); continue; }
         if (!inTag) out.push_back(c);
     }
-    // Collapse whitespace
-    std::string result;
-    bool lastSpace = true;
+    std::string r; bool sp = true;
     for (char c : out) {
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            if (!lastSpace) { result.push_back(' '); lastSpace = true; }
-        } else {
-            result.push_back(c);
-            lastSpace = false;
-        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { if (!sp) { r.push_back(' '); sp = true; } }
+        else { r.push_back(c); sp = false; }
     }
-    while (!result.empty() && result.back() == ' ') result.pop_back();
-    if (!result.empty() && result.front() == ' ') result.erase(result.begin());
-    return result;
+    while (!r.empty() && r.back() == ' ') r.pop_back();
+    if (!r.empty() && r.front() == ' ') r.erase(r.begin());
+    return r;
 }
 
-// Render the overlay to a layered window using GDI+.
 static void paintOverlay(HWND hwnd) {
-    std::lock_guard<std::mutex> lock(g.mutex);
+    std::lock_guard<std::mutex> lk(g.mutex);
 
     auto speakers = buildSnapshot();
 
-    // Also include lingering speakers that just stopped talking
-    std::vector<ActiveSpeaker> lingerSpeakers;
+    // Collect lingering speakers (stopped talking, still within linger window)
     DWORD now = GetTickCount();
+    std::vector<ActiveSpeaker> lingerSpk;
     for (auto it = g.linger.begin(); it != g.linger.end(); ) {
-        if (static_cast<int>(now - it->expireTickMs) >= 0) {
-            it = g.linger.erase(it);
-            continue;
-        }
-        // Check this user isn't already in the active list
-        bool alreadyActive = false;
-        for (auto &sp : speakers) {
-            if (sp.user.id == it->userId) { alreadyActive = true; break; }
-        }
-        if (!alreadyActive) {
+        if (static_cast<int>(now - it->expireTickMs) >= 0) { it = g.linger.erase(it); continue; }
+        bool active = false;
+        for (auto &sp : speakers) { if (sp.user.id == it->userId) { active = true; break; } }
+        if (!active) {
             auto *u = findUser(it->userId);
             if (u) {
                 ActiveSpeaker sp;
-                sp.user = *u;
-                sp.state = "passive";
+                sp.user = *u; sp.state = "passive";
                 sp.isSelf = (it->userId == static_cast<int>(g.localUser));
-                sp.selfMuted = g.selfMuted;
-                sp.selfDeafened = g.selfDeafened;
-                lingerSpeakers.push_back(sp);
+                lingerSpk.push_back(sp);
             }
         }
         ++it;
     }
+    for (auto &ls : lingerSpk) speakers.push_back(ls);
 
-    // Merge: active speakers first, then lingering ones (faded)
-    for (auto &ls : lingerSpeakers)
-        speakers.push_back(ls);
+    const int cardH   = g.config.cardHeight;
+    const int spacing = g.config.cardSpacing;
+    const int w       = g.config.width;
+    const float op    = g.config.opacity;
 
-    int cardH = g.config.cardHeight;
-    int spacing = g.config.cardSpacing;
-    int totalH = speakers.empty() ? 0 :
-        static_cast<int>(speakers.size()) * cardH + (static_cast<int>(speakers.size()) - 1) * spacing;
+    bool hasCards = !speakers.empty();
+    int  totalH   = hasCards
+        ? static_cast<int>(speakers.size()) * cardH + (static_cast<int>(speakers.size()) - 1) * spacing
+        : 0;
 
-    if (!g.config.locked) {
-        // Show placeholder when unlocked
-        totalH = std::max(totalH, 48);
-    }
-
-    if (speakers.empty() && g.config.locked) {
-        // Nothing to show: make the window tiny and invisible
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOACTIVATE);
+    if (!hasCards) {
         ShowWindow(hwnd, SW_HIDE);
         return;
     }
 
-    int w = g.config.width;
-    int h = totalH + (g.config.locked ? 0 : 48);
-
-    // Position the window
+    int h = totalH;
     POINT screenPos = { g.config.x, g.config.y };
 
-    // Create a compatible DC for layered window update
     HDC screenDC = GetDC(nullptr);
-    HDC memDC = CreateCompatibleDC(screenDC);
+    HDC memDC    = CreateCompatibleDC(screenDC);
 
     BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h; // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = w;
+    bmi.bmiHeader.biHeight      = -h;
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    void *bits = nullptr;
+    void   *bits = nullptr;
     HBITMAP hBmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ oldBmp = SelectObject(memDC, hBmp);
-
-    // Clear to fully transparent
     memset(bits, 0, w * h * 4);
 
-    Gdiplus::Graphics graphics(memDC);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+    Gdiplus::Graphics gfx(memDC);
+    gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    gfx.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-    // Draw each speaker card
+    // -- Layout constants derived from cardHeight ----------------------------
+    // Text is positioned proportionally so both lines fill the card vertically.
+    // nameTop is ~17% from top, metaTop is ~57% from top.
+    // This keeps the two lines well spaced with balanced padding.
+    const float nameTop = static_cast<float>(cardH) * 0.17f;
+    const float metaTop = static_cast<float>(cardH) * 0.57f;
+    // Height allocated to each text row (stops text from overflowing into next card)
+    const float nameH   = static_cast<float>(cardH) * 0.38f;
+    const float metaH   = static_cast<float>(cardH) * 0.33f;
+    const float textL   = 14.0f;                              // left margin (past accent rail)
+    const float textR   = static_cast<float>(w) - 26.0f;     // right margin (past corner brackets)
+
+    // -- Draw each speaker card ----------------------------------------------
     int yOff = 0;
     for (size_t i = 0; i < speakers.size(); ++i) {
         auto &sp = speakers[i];
         auto theme = themeForState(sp.state);
-
         BYTE accentR = (theme.accent >> 16) & 0xFF;
-        BYTE accentG = (theme.accent >> 8) & 0xFF;
-        BYTE accentB = theme.accent & 0xFF;
+        BYTE accentG = (theme.accent >>  8) & 0xFF;
+        BYTE accentB =  theme.accent        & 0xFF;
+        float cop = g.config.opacity;
+        if (sp.state == "passive") cop *= 0.45f;  // linger fade
 
-        float op = g.config.opacity;
-        bool isLingering = (sp.state == "passive");
-        if (isLingering) op *= 0.5f;
-
-        // Card background: dark glass
+        // Rounded card background
         {
             Gdiplus::GraphicsPath path;
-            int r = 8;
+            const int r = 8;
             Gdiplus::Rect rc(0, yOff, w, cardH);
-            path.AddArc(rc.X, rc.Y, r * 2, r * 2, 180, 90);
-            path.AddArc(rc.X + rc.Width - r * 2, rc.Y, r * 2, r * 2, 270, 90);
-            path.AddArc(rc.X + rc.Width - r * 2, rc.Y + rc.Height - r * 2, r * 2, r * 2, 0, 90);
-            path.AddArc(rc.X, rc.Y + rc.Height - r * 2, r * 2, r * 2, 90, 90);
+            path.AddArc(rc.X,                    rc.Y,                    r*2, r*2, 180, 90);
+            path.AddArc(rc.X + rc.Width - r*2,   rc.Y,                    r*2, r*2, 270, 90);
+            path.AddArc(rc.X + rc.Width - r*2,   rc.Y + rc.Height - r*2, r*2, r*2,   0, 90);
+            path.AddArc(rc.X,                    rc.Y + rc.Height - r*2, r*2, r*2,  90, 90);
             path.CloseFigure();
 
-            Gdiplus::SolidBrush bgBrush(Gdiplus::Color(static_cast<BYTE>(220 * op), 12, 18, 24));
-            graphics.FillPath(&bgBrush, &path);
+            Gdiplus::SolidBrush bgBrush(Gdiplus::Color(static_cast<BYTE>(215 * cop), 10, 15, 20));
+            gfx.FillPath(&bgBrush, &path);
 
-            // Accent bloom (subtle left glow)
-            Gdiplus::SolidBrush bloomBrush(Gdiplus::Color(static_cast<BYTE>(40 * op), accentR, accentG, accentB));
+            // Subtle accent bloom on the left ~30% of the card
+            Gdiplus::SolidBrush bloomBrush(Gdiplus::Color(static_cast<BYTE>(38 * cop), accentR, accentG, accentB));
             Gdiplus::GraphicsPath bloomPath;
-            bloomPath.AddArc(rc.X, rc.Y, r * 2, r * 2, 180, 90);
-            bloomPath.AddLine(rc.X + r, rc.Y, rc.X + 100, rc.Y);
-            bloomPath.AddLine(rc.X + 100, rc.Y, rc.X + 100, rc.Y + rc.Height);
-            bloomPath.AddArc(rc.X, rc.Y + rc.Height - r * 2, r * 2, r * 2, 90, 90);
+            int bw = w * 3 / 10;
+            bloomPath.AddArc(rc.X, rc.Y, r*2, r*2, 180, 90);
+            bloomPath.AddLine(rc.X + r, rc.Y, rc.X + bw, rc.Y);
+            bloomPath.AddLine(rc.X + bw, rc.Y, rc.X + bw, rc.Y + rc.Height);
+            bloomPath.AddArc(rc.X, rc.Y + rc.Height - r*2, r*2, r*2, 90, 90);
             bloomPath.CloseFigure();
-            graphics.FillPath(&bloomBrush, &bloomPath);
+            gfx.FillPath(&bloomBrush, &bloomPath);
 
-            // Accent rail (left edge)
-            Gdiplus::SolidBrush railBrush(Gdiplus::Color(static_cast<BYTE>(230 * op), accentR, accentG, accentB));
-            graphics.FillRectangle(&railBrush, 0, yOff + 4, 3, cardH - 8);
+            // Accent rail (3px left edge bar)
+            Gdiplus::SolidBrush railBrush(Gdiplus::Color(static_cast<BYTE>(235 * cop), accentR, accentG, accentB));
+            gfx.FillRectangle(&railBrush, 0, yOff + 4, 3, cardH - 8);
 
-            // Corner brackets (top-right and bottom-right)
-            Gdiplus::Pen bracketPen(Gdiplus::Color(static_cast<BYTE>(200 * op), accentR, accentG, accentB), 1.5f);
-            bracketPen.SetStartCap(Gdiplus::LineCapRound);
-            bracketPen.SetEndCap(Gdiplus::LineCapRound);
-            int arm = 12;
-            int bx = w - 6, by = yOff + 5;
-            int byb = yOff + cardH - 6;
-            graphics.DrawLine(&bracketPen, bx - arm, by, bx, by);
-            graphics.DrawLine(&bracketPen, bx, by, bx, by + arm);
-            graphics.DrawLine(&bracketPen, bx, byb - arm, bx, byb);
-            graphics.DrawLine(&bracketPen, bx - arm, byb, bx, byb);
+            // Corner brackets (top-right + bottom-right)
+            Gdiplus::Pen pen(Gdiplus::Color(static_cast<BYTE>(190 * cop), accentR, accentG, accentB), 1.5f);
+            pen.SetStartCap(Gdiplus::LineCapRound);
+            pen.SetEndCap(Gdiplus::LineCapRound);
+            const int arm = 10, bx = w - 6;
+            int byT = yOff + 5, byB = yOff + cardH - 6;
+            gfx.DrawLine(&pen, bx - arm, byT, bx, byT);
+            gfx.DrawLine(&pen, bx, byT, bx, byT + arm);
+            gfx.DrawLine(&pen, bx, byB - arm, bx, byB);
+            gfx.DrawLine(&pen, bx - arm, byB, bx, byB);
         }
 
-        // Speaker name
+        // Speaker name (bold, fills top portion of card)
         {
             std::wstring nameW = toWide(sp.user.name);
             if (sp.isSelf) nameW += L"  (you)";
 
-            Gdiplus::FontFamily fontFamily(L"Segoe UI");
-            Gdiplus::Font nameFont(&fontFamily, 11.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
-            Gdiplus::SolidBrush nameBrush(Gdiplus::Color(static_cast<BYTE>(245 * op), 230, 237, 243));
-            Gdiplus::PointF namePos(14.0f, static_cast<float>(yOff) + 8.0f);
-            Gdiplus::StringFormat nameFmt;
-            nameFmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-            Gdiplus::RectF nameRect(14.0f, static_cast<float>(yOff) + 8.0f,
-                                    static_cast<float>(w) - 30.0f, 20.0f);
-            graphics.DrawString(nameW.c_str(), -1, &nameFont, nameRect, &nameFmt, &nameBrush);
+            Gdiplus::FontFamily ff(L"Segoe UI");
+            Gdiplus::Font font(&ff, g.config.nameFontPt, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+            Gdiplus::SolidBrush brush(Gdiplus::Color(static_cast<BYTE>(248 * cop), 230, 237, 243));
+            Gdiplus::StringFormat fmt;
+            fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            Gdiplus::RectF rect(textL, static_cast<float>(yOff) + nameTop, textR - textL, nameH);
+            gfx.DrawString(nameW.c_str(), -1, &font, rect, &fmt, &brush);
         }
 
-        // Meta line: STATE  ·  channel  ·  status tags
+        // Meta line: STATE · channel · status tags (accent colour, monospace)
         {
             std::wstring meta(theme.label);
             if (g.config.showChannel && !sp.user.channel.empty()) {
                 meta += L"  \x00B7  ";
                 meta += toWide(sp.user.channel);
             }
-            if (sp.user.locallyMuted) {
-                meta += L"  \x00B7  LOCAL MUTED";
-            }
-            if (sp.isSelf) {
-                if (sp.selfDeafened) meta += L"  \x00B7  DEAFENED";
-                else if (sp.selfMuted) meta += L"  \x00B7  SELF MUTED";
-            }
+            if (sp.user.locallyMuted)          meta += L"  \x00B7  LOCAL MUTED";
+            if (sp.isSelf && sp.selfDeafened)  meta += L"  \x00B7  DEAFENED";
+            else if (sp.isSelf && sp.selfMuted) meta += L"  \x00B7  SELF MUTED";
 
-            Gdiplus::FontFamily monoFamily(L"Consolas");
-            Gdiplus::Font metaFont(&monoFamily, 8.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
-            Gdiplus::SolidBrush metaBrush(Gdiplus::Color(static_cast<BYTE>(220 * op), accentR, accentG, accentB));
-            Gdiplus::RectF metaRect(14.0f, static_cast<float>(yOff) + 30.0f,
-                                    static_cast<float>(w) - 30.0f, 16.0f);
-            Gdiplus::StringFormat metaFmt;
-            metaFmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-            graphics.DrawString(meta.c_str(), -1, &metaFont, metaRect, &metaFmt, &metaBrush);
+            Gdiplus::FontFamily ff(L"Consolas");
+            Gdiplus::Font font(&ff, g.config.metaFontPt, Gdiplus::FontStyleBold, Gdiplus::UnitPoint);
+            Gdiplus::SolidBrush brush(Gdiplus::Color(static_cast<BYTE>(215 * cop), accentR, accentG, accentB));
+            Gdiplus::StringFormat fmt;
+            fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+            fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+            fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+            Gdiplus::RectF rect(textL, static_cast<float>(yOff) + metaTop, textR - textL, metaH);
+            gfx.DrawString(meta.c_str(), -1, &font, rect, &fmt, &brush);
         }
 
         yOff += cardH + spacing;
     }
 
-    // Placeholder when unlocked and no speakers
-    if (!g.config.locked) {
-        int placeholderY = yOff;
-        Gdiplus::Pen dashPen(Gdiplus::Color(120, 0, 229, 255), 1.0f);
-        dashPen.SetDashStyle(Gdiplus::DashStyleDash);
-        Gdiplus::Rect placeholderRect(0, placeholderY, w, 40);
-        graphics.DrawRectangle(&dashPen, placeholderRect);
-
-        Gdiplus::SolidBrush placeholderBg(Gdiplus::Color(16, 0, 229, 255));
-        graphics.FillRectangle(&placeholderBg, placeholderRect);
-
-        Gdiplus::FontFamily monoFamily(L"Consolas");
-        Gdiplus::Font placeholderFont(&monoFamily, 9.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush placeholderBrush(Gdiplus::Color(200, 0, 229, 255));
-        Gdiplus::StringFormat sf;
-        sf.SetAlignment(Gdiplus::StringAlignmentCenter);
-        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        Gdiplus::RectF prf(0.0f, static_cast<float>(placeholderY), static_cast<float>(w), 40.0f);
-        graphics.DrawString(L"VOICE OVERLAY  //  DRAG TO POSITION", -1,
-                            &placeholderFont, prf, &sf, &placeholderBrush);
-        h = placeholderY + 40;
-    }
-
-    // Update layered window
-    SIZE size = { w, h };
+    // Commit to layered window
+    SIZE sz = { w, h };
     POINT ptSrc = { 0, 0 };
     BLENDFUNCTION blend = {};
-    blend.BlendOp = AC_SRC_OVER;
+    blend.BlendOp             = AC_SRC_OVER;
     blend.SourceConstantAlpha = 255;
-    blend.AlphaFormat = AC_SRC_ALPHA;
+    blend.AlphaFormat         = AC_SRC_ALPHA;
 
     SetWindowPos(hwnd, HWND_TOPMOST, screenPos.x, screenPos.y, w, h,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    UpdateLayeredWindow(hwnd, screenDC, &screenPos, &size, memDC, &ptSrc, 0, &blend, ULW_ALPHA);
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    UpdateLayeredWindow(hwnd, screenDC, &screenPos, &sz, memDC, &ptSrc, 0, &blend, ULW_ALPHA);
 
     SelectObject(memDC, oldBmp);
     DeleteObject(hBmp);
@@ -619,101 +647,197 @@ static void paintOverlay(HWND hwnd) {
     ReleaseDC(nullptr, screenDC);
 }
 
-// Repaint timer callback (fires ~30fps while there are active speakers).
-static void CALLBACK lingerTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
-    paintOverlay(hwnd);
+// -- Tray icon ---------------------------------------------------------------
+
+static HICON makeTrayIcon() {
+    // Draw a simple microphone-badge icon in memory (32x32 RGBA)
+    int sz = 32;
+    HDC screenDC = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(screenDC);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize     = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth    = sz;
+    bmi.bmiHeader.biHeight   = -sz;
+    bmi.bmiHeader.biPlanes   = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *bits = nullptr;
+    HBITMAP hBmp = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    SelectObject(memDC, hBmp);
+    memset(bits, 0, sz * sz * 4);
+
+    Gdiplus::Bitmap bmpGdi(sz, sz, sz * 4, PixelFormat32bppARGB, static_cast<BYTE *>(bits));
+    Gdiplus::Graphics gfx(&bmpGdi);
+    gfx.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+    Gdiplus::SolidBrush bg(Gdiplus::Color(210, 10, 15, 22));
+    gfx.FillEllipse(&bg, 1, 1, sz - 2, sz - 2);
+
+    Gdiplus::Pen ring(Gdiplus::Color(230, 0, 229, 255), 1.5f);
+    gfx.DrawEllipse(&ring, 1, 1, sz - 3, sz - 3);
+
+    // Simple mic shape
+    Gdiplus::Pen mic(Gdiplus::Color(255, 0, 229, 255), 2.0f);
+    mic.SetStartCap(Gdiplus::LineCapRound);
+    mic.SetEndCap(Gdiplus::LineCapRound);
+    gfx.DrawLine(&mic, 16, 22, 16, 27);
+    gfx.DrawLine(&mic, 12, 27, 20, 27);
+
+    Gdiplus::SolidBrush micBody(Gdiplus::Color(240, 0, 229, 255));
+    Gdiplus::GraphicsPath p;
+    p.AddArc(11, 7, 10, 10, 180, 180);
+    p.AddLine(21, 12, 21, 18);
+    p.AddArc(11, 13, 10, 10, 0, 180);
+    p.CloseFigure();
+    gfx.FillPath(&micBody, &p);
+
+    HICON hIcon = nullptr;
+    bmpGdi.GetHICON(&hIcon);
+
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+    DeleteObject(hBmp);
+    return hIcon;
 }
 
-static void scheduleRepaint() {
-#if defined(_WIN32)
-    if (g.overlayWnd) {
-        PostMessage(g.overlayWnd, WM_USER + 1, 0, 0);
-    }
-#endif
+static void addTrayIcon(HWND hwnd) {
+    HICON hIcon = makeTrayIcon();
+    g.trayData = {};
+    g.trayData.cbSize           = sizeof(g.trayData);
+    g.trayData.hWnd             = hwnd;
+    g.trayData.uID              = 1;
+    g.trayData.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g.trayData.uCallbackMessage = WM_TRAY;
+    g.trayData.hIcon            = hIcon;
+    wcscpy_s(g.trayData.szTip, L"Mumble Voice Overlay");
+    Shell_NotifyIconW(NIM_ADD, &g.trayData);
+    g.trayAdded = true;
 }
+
+static void removeTrayIcon() {
+    if (g.trayAdded) { Shell_NotifyIconW(NIM_DELETE, &g.trayData); g.trayAdded = false; }
+}
+
+static void showTrayMenu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu();
+
+    AppendMenuW(menu, MF_STRING | (g.config.showSelf    ? MF_CHECKED : MF_UNCHECKED), CMD_SHOWSELF,    L"Show my own card");
+    AppendMenuW(menu, MF_STRING | (g.config.showChannel ? MF_CHECKED : MF_UNCHECKED), CMD_SHOWCHANNEL, L"Show channel name");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CMD_RELOAD,     L"Reload config from file");
+    AppendMenuW(menu, MF_STRING, CMD_OPENCONFIG, L"Edit config file...");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CMD_CLOSE,      L"Close overlay");
+
+    // Required so the menu dismisses when clicking elsewhere
+    SetForegroundWindow(hwnd);
+
+    POINT pt; GetCursorPos(&pt);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+                             pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+
+    std::lock_guard<std::mutex> lk(g.mutex);
+
+    switch (cmd) {
+    case CMD_SHOWSELF:
+        g.config.showSelf = !g.config.showSelf;
+        saveConfig(g.config);
+        break;
+
+    case CMD_SHOWCHANNEL:
+        g.config.showChannel = !g.config.showChannel;
+        saveConfig(g.config);
+        break;
+
+    case CMD_RELOAD:
+        PostMessage(hwnd, WM_RELOAD, 0, 0);
+        break;
+
+    case CMD_OPENCONFIG: {
+        // Write the config file first so there's something to open
+        saveConfig(g.config);
+        std::wstring path = configPath();
+        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOW);
+        break;
+    }
+
+    case CMD_CLOSE:
+        PostMessage(hwnd, WM_CLOSE, 0, 0);
+        break;
+    }
+
+    PostMessage(hwnd, WM_REPAINT, 0, 0);
+}
+
+// -- Window procedure --------------------------------------------------------
 
 static LRESULT CALLBACK overlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
-        // Start a timer for linger expiry and repaint (~15fps is plenty)
-        g.lingerTimerId = SetTimer(hwnd, 1, 66, lingerTimerProc);
+        g.lingerTimerId = SetTimer(hwnd, 1, 66, [](HWND hw, UINT, UINT_PTR, DWORD) { paintOverlay(hw); });
+        g.wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+        addTrayIcon(hwnd);
         return 0;
 
-    case WM_USER + 1:
+    case WM_REPAINT:
         paintOverlay(hwnd);
         return 0;
 
-    case WM_LBUTTONDOWN:
-        if (!g.config.locked) {
-            g.dragging = true;
-            SetCapture(hwnd);
-            POINT cursor;
-            GetCursorPos(&cursor);
-            RECT wr;
-            GetWindowRect(hwnd, &wr);
-            g.dragOffset.x = cursor.x - wr.left;
-            g.dragOffset.y = cursor.y - wr.top;
-        }
+    case WM_RELOAD: {
+        std::lock_guard<std::mutex> lk(g.mutex);
+        g.config = loadConfig();
+        PostMessage(hwnd, WM_REPAINT, 0, 0);
         return 0;
+    }
 
-    case WM_MOUSEMOVE:
-        if (g.dragging) {
-            POINT cursor;
-            GetCursorPos(&cursor);
-            int nx = cursor.x - g.dragOffset.x;
-            int ny = cursor.y - g.dragOffset.y;
-            g.config.x = nx;
-            g.config.y = ny;
-            paintOverlay(hwnd);
-        }
-        return 0;
-
-    case WM_LBUTTONUP:
-        if (g.dragging) {
-            g.dragging = false;
-            ReleaseCapture();
+    case WM_TRAY:
+        if (lParam == WM_RBUTTONUP) {
+            showTrayMenu(hwnd);
         }
         return 0;
 
     case WM_DESTROY:
-        if (g.lingerTimerId) {
-            KillTimer(hwnd, g.lingerTimerId);
-            g.lingerTimerId = 0;
-        }
+        removeTrayIcon();
+        if (g.lingerTimerId) { KillTimer(hwnd, g.lingerTimerId); g.lingerTimerId = 0; }
         PostQuitMessage(0);
         return 0;
 
     default:
+        if (msg == g.wmTaskbarCreated) {
+            // Explorer restarted — re-add tray icon
+            addTrayIcon(hwnd);
+        }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 }
 
-static void overlayThreadFunc() {
-    // Initialize GDI+
-    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    Gdiplus::GdiplusStartup(&g.gdiplusToken, &gdiplusStartupInput, nullptr);
+// -- Overlay thread ----------------------------------------------------------
 
-    const wchar_t *className = L"MumbleVoiceOverlay";
+static void overlayThreadFunc() {
+    Gdiplus::GdiplusStartupInput gdi;
+    Gdiplus::GdiplusStartup(&g.gdiplusToken, &gdi, nullptr);
+
+    const wchar_t *cls = L"MumbleVoiceOverlay";
     HINSTANCE hInst = GetModuleHandle(nullptr);
 
     WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
+    wc.cbSize      = sizeof(wc);
     wc.lpfnWndProc = overlayWndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = className;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hInstance   = hInst;
+    wc.lpszClassName = cls;
+    wc.hCursor     = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
 
-    g.overlayWnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-        className,
-        L"Mumble Voice Overlay",
-        WS_POPUP,
-        g.config.x, g.config.y,
-        g.config.width, 1,
-        nullptr, nullptr, hInst, nullptr
-    );
+    // WS_EX_TRANSPARENT makes the window permanently click-through — the overlay
+    // never steals input from the game. Position is configured via config.json.
+    DWORD exStyle = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
 
+    g.overlayWnd = CreateWindowExW(exStyle, cls, L"Mumble Voice Overlay", WS_POPUP,
+                                   g.config.x, g.config.y, g.config.width, 1,
+                                   nullptr, nullptr, hInst, nullptr);
     if (!g.overlayWnd) {
         Gdiplus::GdiplusShutdown(g.gdiplusToken);
         return;
@@ -729,11 +853,16 @@ static void overlayThreadFunc() {
 
     g.overlayWnd = nullptr;
     Gdiplus::GdiplusShutdown(g.gdiplusToken);
-    UnregisterClassW(className, hInst);
+    UnregisterClassW(cls, hInst);
+}
+
+static void scheduleRepaint() {
+    if (g.overlayWnd) PostMessage(g.overlayWnd, WM_REPAINT, 0, 0);
 }
 
 static void startOverlay() {
     if (g.overlayRunning) return;
+    g.config = loadConfig();
     g.overlayRunning = true;
     g.overlayThread = std::thread(overlayThreadFunc);
 }
@@ -741,15 +870,11 @@ static void startOverlay() {
 static void stopOverlay() {
     if (!g.overlayRunning) return;
     g.overlayRunning = false;
-    if (g.overlayWnd) {
-        PostMessage(g.overlayWnd, WM_CLOSE, 0, 0);
-    }
-    if (g.overlayThread.joinable()) {
-        g.overlayThread.join();
-    }
+    if (g.overlayWnd) PostMessage(g.overlayWnd, WM_CLOSE, 0, 0);
+    if (g.overlayThread.joinable()) g.overlayThread.join();
 }
 
-#else // Non-Windows stubs
+#else  // Non-Windows stubs
 
 static void scheduleRepaint() {}
 static void startOverlay() {}
@@ -757,236 +882,157 @@ static void stopOverlay() {}
 
 #endif // _WIN32
 
-// ---- Update speaker state and trigger repaint ----------------------------
+// ---- Update speaker model & trigger repaint --------------------------------
 
-static void recordUser(mumble_connection_t connection, mumble_userid_t user, bool markKnown) {
+static void recordUser(mumble_connection_t conn, mumble_userid_t user, bool markKnown) {
     mumble_channelid_t channelId = -1;
-    std::string name    = userName(connection, user);
-    std::string channel = channelNameOfUser(connection, user, &channelId);
-    std::string comment = userComment(connection, user);
-    std::string hash    = userHash(connection, user);
-
+    std::string name    = userName(conn, user);
+    std::string channel = channelNameOfUser(conn, user, &channelId);
+    std::string comment = userComment(conn, user);
+    std::string hash    = userHash(conn, user);
     {
-        std::lock_guard<std::mutex> lock(g.mutex);
-        auto &u = getOrCreateUser(static_cast<int>(user));
-        u.name = name.empty() ? ("User " + std::to_string(user)) : name;
-        u.channel = channel;
-        u.channelId = static_cast<int>(channelId);
-        u.comment = comment;
-        u.hash = hash;
-        u.locallyMuted = userLocallyMuted(connection, user);
-        u.isSelf = (user == g.localUser);
-
-        if (markKnown) {
-            g.known.push_back(user);
-        }
+        std::lock_guard<std::mutex> lk(g.mutex);
+        auto &u        = getOrCreateUser(static_cast<int>(user));
+        u.name         = name.empty() ? ("User " + std::to_string(user)) : name;
+        u.channel      = channel;
+        u.channelId    = static_cast<int>(channelId);
+        u.comment      = comment;
+        u.hash         = hash;
+        u.locallyMuted = userLocallyMuted(conn, user);
+        u.isSelf       = (user == g.localUser);
+        if (markKnown) g.known.push_back(user);
     }
     scheduleRepaint();
 }
 
 static void recordTalk(mumble_userid_t user, mumble_talking_state_t state) {
-    std::string stateName = talkingStateName(state);
+    std::string name = talkingStateName(state);
     {
-        std::lock_guard<std::mutex> lock(g.mutex);
+        std::lock_guard<std::mutex> lk(g.mutex);
         std::string prev = getRawTalkState(static_cast<int>(user));
-        setTalkState(static_cast<int>(user), stateName);
+        setTalkState(static_cast<int>(user), name);
 
-        // If transitioning from active to passive, start linger
-        if (isActiveState(prev) && !isActiveState(stateName)) {
+        if (isActiveState(prev) && !isActiveState(name)) {
 #if defined(_WIN32)
-            // Remove existing linger for this user
             g.linger.erase(std::remove_if(g.linger.begin(), g.linger.end(),
                 [user](const LingerEntry &e) { return e.userId == static_cast<int>(user); }),
                 g.linger.end());
-            g.linger.push_back({static_cast<int>(user), GetTickCount() + static_cast<DWORD>(g.config.lingerMs)});
+            g.linger.push_back({static_cast<int>(user),
+                GetTickCount() + static_cast<DWORD>(g.config.lingerMs)});
 #endif
         }
     }
     scheduleRepaint();
 }
 
-static void recordSelf(mumble_connection_t connection) {
+static void recordSelf(mumble_connection_t conn) {
     bool muted = false, deafened = false;
-    if (g.api.isLocalUserMuted) g.api.isLocalUserMuted(g.id, &muted);
+    if (g.api.isLocalUserMuted)    g.api.isLocalUserMuted(g.id, &muted);
     if (g.api.isLocalUserDeafened) g.api.isLocalUserDeafened(g.id, &deafened);
-    {
-        std::lock_guard<std::mutex> lock(g.mutex);
-        g.selfMuted = muted;
-        g.selfDeafened = deafened;
-    }
-    (void)connection;
+    { std::lock_guard<std::mutex> lk(g.mutex); g.selfMuted = muted; g.selfDeafened = deafened; }
+    (void)conn;
     scheduleRepaint();
 }
 
-static void recordChannelRoster(mumble_connection_t connection) {
+static void recordChannelRoster(mumble_connection_t conn) {
     if (!g.api.getChannelOfUser || !g.api.getUsersInChannel) return;
     mumble_channelid_t channel = -1;
-    if (g.api.getChannelOfUser(g.id, connection, g.localUser, &channel) != MUMBLE_EC_OK) return;
-    mumble_userid_t *users = nullptr;
-    size_t count = 0;
-    if (g.api.getUsersInChannel(g.id, connection, channel, &users, &count) != MUMBLE_EC_OK) return;
-    for (size_t i = 0; i < count; ++i) {
-        recordUser(connection, users[i], true);
-    }
+    if (g.api.getChannelOfUser(g.id, conn, g.localUser, &channel) != MUMBLE_EC_OK) return;
+    mumble_userid_t *users = nullptr; size_t count = 0;
+    if (g.api.getUsersInChannel(g.id, conn, channel, &users, &count) != MUMBLE_EC_OK) return;
+    for (size_t i = 0; i < count; ++i) recordUser(conn, users[i], true);
     if (users) g.api.freeMemory(g.id, users);
 }
 
 }  // namespace
 
-// =========================================================================
-//  Mandatory plugin functions
-// =========================================================================
+// ===========================================================================
+//  Mumble plugin entry points
+// ===========================================================================
 
 mumble_error_t mumble_init(mumble_plugin_id_t id) {
-    g.id = id;
-    startOverlay();
-    return MUMBLE_STATUS_OK;
+    g.id = id; startOverlay(); return MUMBLE_STATUS_OK;
 }
-
-void mumble_shutdown() {
-    stopOverlay();
-}
+void mumble_shutdown() { stopOverlay(); }
 
 struct MumbleStringWrapper mumble_getName() {
-    MumbleStringWrapper wrapper;
-    wrapper.data           = PLUGIN_NAME;
-    wrapper.size           = std::strlen(PLUGIN_NAME);
-    wrapper.needsReleasing = false;
-    return wrapper;
+    return { PLUGIN_NAME, std::strlen(PLUGIN_NAME), false };
 }
-
 mumble_version_t mumble_getAPIVersion() {
-    mumble_version_t version;
-    version.major = 1;
-    version.minor = 0;
-    version.patch = 0;
-    return version;
+    return { 1, 0, 0 };
 }
-
-void mumble_registerAPIFunctions(void *apiStruct) {
-    if (apiStruct) {
-        g.api      = *reinterpret_cast<mumble_api_t *>(apiStruct);
-        g.apiValid = true;
-    }
+void mumble_registerAPIFunctions(void *api) {
+    if (api) { g.api = *reinterpret_cast<mumble_api_t *>(api); g.apiValid = true; }
 }
-
 void mumble_releaseResource(const void *) {}
-
-// =========================================================================
-//  General information functions
-// =========================================================================
-
 void mumble_setMumbleInfo(mumble_version_t, mumble_version_t, mumble_version_t) {}
-
-mumble_version_t mumble_getVersion() {
-    mumble_version_t version;
-    version.major = 1;
-    version.minor = 0;
-    version.patch = 0;
-    return version;
-}
-
+mumble_version_t mumble_getVersion() { return { 1, 0, 0 }; }
 struct MumbleStringWrapper mumble_getAuthor() {
-    MumbleStringWrapper wrapper;
-    wrapper.data           = PLUGIN_AUTHOR;
-    wrapper.size           = std::strlen(PLUGIN_AUTHOR);
-    wrapper.needsReleasing = false;
-    return wrapper;
+    return { PLUGIN_AUTHOR, std::strlen(PLUGIN_AUTHOR), false };
 }
-
 struct MumbleStringWrapper mumble_getDescription() {
-    MumbleStringWrapper wrapper;
-    wrapper.data           = PLUGIN_DESC;
-    wrapper.size           = std::strlen(PLUGIN_DESC);
-    wrapper.needsReleasing = false;
-    return wrapper;
+    return { PLUGIN_DESC, std::strlen(PLUGIN_DESC), false };
 }
+uint32_t mumble_getFeatures() { return MUMBLE_FEATURE_NONE; }
 
-uint32_t mumble_getFeatures() {
-    return MUMBLE_FEATURE_NONE;
-}
-
-// =========================================================================
-//  Event callbacks
-// =========================================================================
-
-void mumble_onServerConnected(mumble_connection_t connection) {
-    std::lock_guard<std::mutex> lock(g.mutex);
-    g.connection   = connection;
-    g.synchronized = false;
-    g.known.clear();
-    g.users.clear();
-    g.talkStates.clear();
+void mumble_onServerConnected(mumble_connection_t conn) {
+    std::lock_guard<std::mutex> lk(g.mutex);
+    g.connection = conn; g.synchronized = false;
+    g.known.clear(); g.users.clear(); g.talkStates.clear();
 #if defined(_WIN32)
     g.linger.clear();
 #endif
 }
-
 void mumble_onServerDisconnected(mumble_connection_t) {
     {
-        std::lock_guard<std::mutex> lock(g.mutex);
-        g.connection   = -1;
-        g.synchronized = false;
-        g.known.clear();
-        g.users.clear();
-        g.talkStates.clear();
+        std::lock_guard<std::mutex> lk(g.mutex);
+        g.connection = -1; g.synchronized = false;
+        g.known.clear(); g.users.clear(); g.talkStates.clear();
 #if defined(_WIN32)
         g.linger.clear();
 #endif
     }
     scheduleRepaint();
 }
-
-void mumble_onServerSynchronized(mumble_connection_t connection) {
+void mumble_onServerSynchronized(mumble_connection_t conn) {
     if (!apiReady()) return;
     {
-        std::lock_guard<std::mutex> lock(g.mutex);
-        g.connection   = connection;
-        g.synchronized = true;
-        g.known.clear();
+        std::lock_guard<std::mutex> lk(g.mutex);
+        g.connection = conn; g.synchronized = true; g.known.clear();
     }
     if (g.api.getLocalUserID) {
         mumble_userid_t local = 0;
-        if (g.api.getLocalUserID(g.id, connection, &local) == MUMBLE_EC_OK) {
-            std::lock_guard<std::mutex> lock(g.mutex);
-            g.localUser = local;
+        if (g.api.getLocalUserID(g.id, conn, &local) == MUMBLE_EC_OK) {
+            std::lock_guard<std::mutex> lk(g.mutex); g.localUser = local;
         }
     }
-    recordSelf(connection);
-    recordChannelRoster(connection);
+    recordSelf(conn);
+    recordChannelRoster(conn);
 }
-
-void mumble_onChannelEntered(mumble_connection_t connection, mumble_userid_t userID,
+void mumble_onChannelEntered(mumble_connection_t conn, mumble_userid_t uid,
                               mumble_channelid_t, mumble_channelid_t) {
     if (!apiReady()) return;
-    if (userID == g.localUser) {
-        recordChannelRoster(connection);
-    } else {
-        recordUser(connection, userID, true);
-    }
+    if (uid == g.localUser) recordChannelRoster(conn);
+    else recordUser(conn, uid, true);
 }
-
-void mumble_onChannelExited(mumble_connection_t, mumble_userid_t userID, mumble_channelid_t) {
+void mumble_onChannelExited(mumble_connection_t, mumble_userid_t uid, mumble_channelid_t) {
     {
-        std::lock_guard<std::mutex> lock(g.mutex);
-        removeUser(static_cast<int>(userID));
+        std::lock_guard<std::mutex> lk(g.mutex);
+        removeUser(static_cast<int>(uid));
         for (auto it = g.known.begin(); it != g.known.end(); ++it) {
-            if (*it == userID) { g.known.erase(it); break; }
+            if (*it == uid) { g.known.erase(it); break; }
         }
 #if defined(_WIN32)
         g.linger.erase(std::remove_if(g.linger.begin(), g.linger.end(),
-            [userID](const LingerEntry &e) { return e.userId == static_cast<int>(userID); }),
+            [uid](const LingerEntry &e) { return e.userId == static_cast<int>(uid); }),
             g.linger.end());
 #endif
     }
     scheduleRepaint();
 }
-
-void mumble_onUserTalkingStateChanged(mumble_connection_t connection, mumble_userid_t userID,
-                                      mumble_talking_state_t talkingState) {
+void mumble_onUserTalkingStateChanged(mumble_connection_t conn, mumble_userid_t uid,
+                                      mumble_talking_state_t state) {
     if (!apiReady()) return;
-    if (!isKnown(userID)) {
-        recordUser(connection, userID, true);
-    }
-    recordTalk(userID, talkingState);
+    if (!isKnown(uid)) recordUser(conn, uid, true);
+    recordTalk(uid, state);
 }

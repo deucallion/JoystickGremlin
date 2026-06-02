@@ -230,7 +230,7 @@ static StateTheme themeForState(const std::string &state) {
     return { 0xFF00E5FF, L"TALKING" };
 }
 
-struct LingerEntry { int userId; DWORD expireTickMs; };
+struct LingerEntry { int userId; DWORD expireTickMs; std::string lastState; };
 
 #endif
 
@@ -477,7 +477,7 @@ static void paintOverlay(HWND hwnd) {
             auto *u = findUser(it->userId);
             if (u) {
                 ActiveSpeaker sp;
-                sp.user = *u; sp.state = "passive";
+                sp.user = *u; sp.state = it->lastState;
                 sp.isSelf = (it->userId == static_cast<int>(g.localUser));
                 lingerSpk.push_back(sp);
             }
@@ -910,6 +910,11 @@ static void recordTalk(mumble_userid_t user, mumble_talking_state_t state) {
     {
         std::lock_guard<std::mutex> lk(g.mutex);
         std::string prev = getRawTalkState(static_cast<int>(user));
+#if defined(_WIN32)
+        // Capture the display state (peak-corrected) before setTalkState clears it.
+        // This is what the linger card will show — e.g. SHOUT not TALKING.
+        std::string prevDisplay = getDisplayTalkState(static_cast<int>(user));
+#endif
         setTalkState(static_cast<int>(user), name);
 
         if (isActiveState(prev) && !isActiveState(name)) {
@@ -918,7 +923,7 @@ static void recordTalk(mumble_userid_t user, mumble_talking_state_t state) {
                 [user](const LingerEntry &e) { return e.userId == static_cast<int>(user); }),
                 g.linger.end());
             g.linger.push_back({static_cast<int>(user),
-                GetTickCount() + static_cast<DWORD>(g.config.lingerMs)});
+                GetTickCount() + static_cast<DWORD>(g.config.lingerMs), prevDisplay});
 #endif
         }
     }

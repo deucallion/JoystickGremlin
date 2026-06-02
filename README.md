@@ -18,25 +18,24 @@ process, so there's nothing for EAC to object to.
 
 ## How it works
 
+The plugin draws its own transparent, always-on-top Win32 window directly —
+no second app, no Python, no injection into the game process.
+
 ```
-┌────────────┐   localhost UDP    ┌─────────────────────┐
-│  Mumble    │   JSON datagrams   │  Voice Overlay app  │
-│  + plugin  │ ─────────────────► │  (PyQt6, tray icon) │
-│ (observes) │   :27812           │  draws over game    │
-└────────────┘                    └─────────────────────┘
-   no drawing                        no game hooks
+┌──────────────────────────────────────────────────────┐
+│  Mumble + plugin DLL                                 │
+│  ├─ observes talking state via Mumble plugin API     │
+│  └─ draws overlay window with GDI+ (Win32 layered    │
+│     window — lives in Mumble's process, NOT the game)│
+└──────────────────────────────────────────────────────┘
 ```
 
-- **`plugin/`** — a tiny native Mumble plugin (C++). It uses Mumble's plugin
-  API to watch talking-state changes and gather each speaker's name, channel,
-  comment, identity hash, and mute state, then fires newline-delimited JSON over
-  localhost UDP. It never draws anything and never blocks Mumble.
-- **`overlay/`** — a PyQt6 app that listens on that port and renders a stack of
-  "speaker cards." Separate process, no injection → EAC-safe.
-- **`tools/simulator.py`** — replays a fake Mumble session so you can see and
-  position the overlay without connecting to a server.
-- **`docs/`** — the [UDP protocol](docs/PROTOCOL.md) and
-  [install guide](docs/INSTALL.md).
+- **`plugin/`** — the whole thing. One C++ file, one DLL. Watches who is
+  talking via the Mumble plugin API, renders speaker cards into a GDI+ layered
+  window (WS_EX_TOPMOST, WS_EX_TRANSPARENT when locked → never steals clicks).
+- **`overlay/`** — kept as a Linux/macOS fallback. On those platforms the plugin
+  streams state over UDP and the Python app draws the window instead.
+- **`docs/`** — [install guide](docs/INSTALL.md) and [UDP protocol](docs/PROTOCOL.md).
 
 ## What a speaker card shows
 
@@ -52,17 +51,17 @@ Everything the Mumble plugin API exposes about a talker:
 
 ## Quick start
 
+```powershell
+# Windows (self-contained — just the DLL, no Python needed):
+.\build.ps1
+# Then: Mumble → Settings → Plugins → Install plugin... → pick DLL from Desktop
+# Ctrl+Shift+V in-game to unlock/reposition. Right-click for options.
+```
+
 ```bash
-# 1. Build the plugin and install it via Mumble → Settings → Plugins
+# Linux/macOS — build plugin, then run companion Python app:
 cd plugin && cmake -S . -B build && cmake --build build
-# Windows shortcut: from the repo root, run  .\build.ps1
-# (builds the DLL and copies it to your Desktop)
-
-# 2. Run the overlay (system tray app)
-cd ../overlay && python -m pip install -r requirements.txt && python -m voice_overlay
-
-# 3. (optional) See it without Mumble
-python tools/simulator.py
+cd ../overlay && pip install -r requirements.txt && python -m voice_overlay
 ```
 
 Full instructions: **[docs/INSTALL.md](docs/INSTALL.md)**.

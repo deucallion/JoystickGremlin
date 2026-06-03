@@ -676,6 +676,16 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (hctl) SendMessage(hctl, WM_SETFONT, reinterpret_cast<WPARAM>(hHead), TRUE);
         }
 
+        // Resize window to fit content exactly
+        int clientW = startX + contentW + startX;
+        int clientH = y + btnH + 16;
+        DWORD style   = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
+        DWORD exStyle = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+        RECT rc = { 0, 0, clientW, clientH };
+        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+        SetWindowPos(hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+
         return 0;
     }
 
@@ -796,12 +806,11 @@ static void openSettingsDialog() {
         registered = true;
     }
 
-    int dlgW = 290, dlgH = 540;
     g.settingsDlg = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         cls, L"Voice Overlay Settings",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, dlgW, dlgH,
+        CW_USEDEFAULT, CW_USEDEFAULT, 300, 100,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g.settingsDlg, SW_SHOW);

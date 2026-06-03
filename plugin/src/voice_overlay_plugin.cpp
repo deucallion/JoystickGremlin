@@ -27,8 +27,10 @@
 #include <shellapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <dwmapi.h>
 #pragma comment(lib, "Gdiplus.lib")
 #pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Dwmapi.lib")
 
 #endif
 
@@ -451,8 +453,23 @@ enum {
     IDC_LBL_LINGER, IDC_EDIT_LINGER,
     IDC_LBL_MAXCARDS, IDC_EDIT_MAXCARDS,
     IDC_CHK_SHOWSELF, IDC_CHK_SHOWCHANNEL,
-    IDC_BTN_OK, IDC_BTN_CANCEL, IDC_BTN_APPLY
+    IDC_BTN_OK, IDC_BTN_CANCEL, IDC_BTN_APPLY,
+    IDC_HDR_POSITION, IDC_HDR_TEXT, IDC_HDR_APPEARANCE, IDC_HDR_BEHAVIOUR
 };
+
+// Dark theme colors for settings dialog
+static constexpr COLORREF kDlgBg       = RGB(22, 24, 30);
+static constexpr COLORREF kDlgText     = RGB(210, 215, 225);
+static constexpr COLORREF kDlgDimText  = RGB(140, 145, 158);
+static constexpr COLORREF kDlgEditBg   = RGB(34, 37, 46);
+static constexpr COLORREF kDlgEditBor  = RGB(52, 56, 68);
+static constexpr COLORREF kDlgAccent   = RGB(90, 140, 255);
+static constexpr COLORREF kDlgBtnBg    = RGB(42, 46, 58);
+static constexpr COLORREF kDlgBtnHover = RGB(56, 62, 78);
+static constexpr COLORREF kDlgSep      = RGB(42, 46, 58);
+
+static HBRUSH g_dlgBgBrush   = nullptr;
+static HBRUSH g_editBgBrush  = nullptr;
 
 static std::wstring toWide(const std::string &s) {
     if (s.empty()) return {};
@@ -483,34 +500,33 @@ static std::string stripHtml(const std::string &html) {
 
 // -- Settings dialog (Win32 native) ------------------------------------------
 
-static HWND createLabel(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                           x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
+static HWND mkCtrl(HWND par, const wchar_t *cls, const wchar_t *text, DWORD style,
+                   int id, int x, int y, int w, int h, DWORD exStyle = 0) {
+    return CreateWindowExW(exStyle, cls, text, WS_CHILD | WS_VISIBLE | style,
+                           x, y, w, h, par, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
                            GetModuleHandle(nullptr), nullptr);
 }
 
-static HWND createEdit(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h) {
-    HWND hw = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text,
-                              WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                              x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
-                              GetModuleHandle(nullptr), nullptr);
-    return hw;
+static HWND createLabel(HWND p, int id, const wchar_t *t, int x, int y, int w, int h) {
+    return mkCtrl(p, L"STATIC", t, SS_RIGHT, id, x, y, w, h);
 }
 
-static HWND createCheck(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h, bool checked) {
-    HWND hw = CreateWindowExW(0, L"BUTTON", text,
-                              WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                              x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
-                              GetModuleHandle(nullptr), nullptr);
+static HWND createSectionHeader(HWND p, int id, const wchar_t *t, int x, int y, int w) {
+    return mkCtrl(p, L"STATIC", t, SS_LEFT, id, x, y, w, 16);
+}
+
+static HWND createEdit(HWND p, int id, const wchar_t *t, int x, int y, int w, int h) {
+    return mkCtrl(p, L"EDIT", t, ES_AUTOHSCROLL, id, x, y, w, h, WS_EX_CLIENTEDGE);
+}
+
+static HWND createCheck(HWND p, int id, const wchar_t *t, int x, int y, int w, int h, bool checked) {
+    HWND hw = mkCtrl(p, L"BUTTON", t, BS_AUTOCHECKBOX, id, x, y, w, h);
     SendMessage(hw, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
     return hw;
 }
 
-static HWND createButton(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h) {
-    return CreateWindowExW(0, L"BUTTON", text,
-                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                           x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
-                           GetModuleHandle(nullptr), nullptr);
+static HWND createButton(HWND p, int id, const wchar_t *t, int x, int y, int w, int h) {
+    return mkCtrl(p, L"BUTTON", t, BS_OWNERDRAW, id, x, y, w, h);
 }
 
 static int getEditInt(HWND dlg, int id) {
@@ -570,57 +586,174 @@ static void populateDialogFromConfig(HWND dlg) {
     CheckDlgButton(dlg, IDC_CHK_SHOWCHANNEL, g.config.showChannel ? BST_CHECKED : BST_UNCHECKED);
 }
 
+static constexpr int kMaxSeps = 4;
+static struct { int x, y, w; } g_seps[kMaxSeps];
+static int g_sepCount = 0;
+
+static void addSeparator(int x, int y, int w) {
+    if (g_sepCount < kMaxSeps) g_seps[g_sepCount++] = { x, y, w };
+}
+
 static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
-        // Set dark background
-        // Build the form: labels on the left, edits on the right
-        const int lblW = 120, editW = 80, rowH = 24, pad = 10, startY = 15, startX = 15;
-        int y = startY;
+        g_sepCount = 0;
+        if (!g_dlgBgBrush)  g_dlgBgBrush  = CreateSolidBrush(kDlgBg);
+        if (!g_editBgBrush) g_editBgBrush = CreateSolidBrush(kDlgEditBg);
 
+        // Dark title bar (Windows 10 1809+)
+        BOOL useDark = TRUE;
+        DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &useDark, sizeof(useDark));
+
+        const int lblW = 130, editW = 90, rowH = 26, pad = 12;
+        const int startX = 20, contentW = lblW + pad + editW;
+        int y = 16;
+
+        // --- Section: Position ---
+        createSectionHeader(hwnd, IDC_HDR_POSITION, L"POSITION", startX, y, contentW);
+        y += 22;
         struct Row { int lblId; const wchar_t *label; int editId; };
-        Row rows[] = {
-            { IDC_LBL_X,        L"Position X:",     IDC_EDIT_X },
-            { IDC_LBL_Y,        L"Position Y:",     IDC_EDIT_Y },
+        Row posRows[] = {
+            { IDC_LBL_X, L"X:", IDC_EDIT_X },
+            { IDC_LBL_Y, L"Y:", IDC_EDIT_Y },
+        };
+        for (auto &r : posRows) {
+            createLabel(hwnd, r.lblId, r.label, startX, y + 3, lblW, rowH - 4);
+            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH);
+            y += rowH + 4;
+        }
+
+        y += 6;
+        addSeparator(startX, y, contentW);
+        y += 10;
+
+        // --- Section: Appearance ---
+        createSectionHeader(hwnd, IDC_HDR_APPEARANCE, L"APPEARANCE", startX, y, contentW);
+        y += 22;
+        Row appRows[] = {
             { IDC_LBL_WIDTH,    L"Card width:",     IDC_EDIT_WIDTH },
             { IDC_LBL_CARDH,    L"Card height:",    IDC_EDIT_CARDH },
             { IDC_LBL_SPACING,  L"Card spacing:",   IDC_EDIT_SPACING },
             { IDC_LBL_NAMEFONT, L"Name font (pt):", IDC_EDIT_NAMEFONT },
             { IDC_LBL_METAFONT, L"Meta font (pt):", IDC_EDIT_METAFONT },
-            { IDC_LBL_OPACITY,  L"Opacity (0-1):",  IDC_EDIT_OPACITY },
-            { IDC_LBL_LINGER,   L"Linger (ms):",    IDC_EDIT_LINGER },
-            { IDC_LBL_MAXCARDS, L"Max cards:",      IDC_EDIT_MAXCARDS },
+            { IDC_LBL_OPACITY,  L"Opacity (0\x20131):", IDC_EDIT_OPACITY },
         };
-
-        for (auto &r : rows) {
-            createLabel(hwnd, r.lblId, r.label, startX, y + 2, lblW, rowH - 4);
-            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH - 2);
+        for (auto &r : appRows) {
+            createLabel(hwnd, r.lblId, r.label, startX, y + 3, lblW, rowH - 4);
+            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH);
             y += rowH + 4;
         }
 
+        y += 6;
+        addSeparator(startX, y, contentW);
+        y += 10;
+
+        // --- Section: Behaviour ---
+        createSectionHeader(hwnd, IDC_HDR_BEHAVIOUR, L"BEHAVIOUR", startX, y, contentW);
+        y += 22;
+        Row behRows[] = {
+            { IDC_LBL_LINGER,   L"Linger (ms):", IDC_EDIT_LINGER },
+            { IDC_LBL_MAXCARDS, L"Max cards:",   IDC_EDIT_MAXCARDS },
+        };
+        for (auto &r : behRows) {
+            createLabel(hwnd, r.lblId, r.label, startX, y + 3, lblW, rowH - 4);
+            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH);
+            y += rowH + 4;
+        }
         y += 4;
-        createCheck(hwnd, IDC_CHK_SHOWSELF,    L"Show my own card",  startX + 6, y, 200, 20, g.config.showSelf);
+        createCheck(hwnd, IDC_CHK_SHOWSELF,    L"Show my own card",  startX + 4, y, 220, 20, g.config.showSelf);
         y += 26;
-        createCheck(hwnd, IDC_CHK_SHOWCHANNEL, L"Show channel name", startX + 6, y, 200, 20, g.config.showChannel);
+        createCheck(hwnd, IDC_CHK_SHOWCHANNEL, L"Show channel name", startX + 4, y, 220, 20, g.config.showChannel);
         y += 36;
 
-        int btnW = 70, btnH = 28;
-        int btnArea = startX + lblW + pad + editW;
-        createButton(hwnd, IDC_BTN_APPLY,  L"Apply",  btnArea - btnW * 3 - 16, y, btnW, btnH);
-        createButton(hwnd, IDC_BTN_OK,     L"OK",     btnArea - btnW * 2 - 8,  y, btnW, btnH);
-        createButton(hwnd, IDC_BTN_CANCEL, L"Cancel", btnArea - btnW,          y, btnW, btnH);
+        // --- Buttons ---
+        drawSeparator(hwnd, startX, y - 10, contentW);
+        int btnW = 76, btnH = 30;
+        int bx = startX + contentW - btnW;
+        createButton(hwnd, IDC_BTN_CANCEL, L"Cancel", bx, y, btnW, btnH);
+        bx -= btnW + 8;
+        createButton(hwnd, IDC_BTN_OK,     L"OK",     bx, y, btnW, btnH);
+        bx -= btnW + 8;
+        createButton(hwnd, IDC_BTN_APPLY,  L"Apply",  bx, y, btnW, btnH);
 
         populateDialogFromConfig(hwnd);
 
-        // Set font on all child controls
-        HFONT hFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        HFONT hBody = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        HFONT hHead = CreateFontW(-11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                   DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
         EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
             SendMessage(child, WM_SETFONT, static_cast<WPARAM>(lp), TRUE);
             return TRUE;
-        }, reinterpret_cast<LPARAM>(hFont));
+        }, reinterpret_cast<LPARAM>(hBody));
+
+        int headerIds[] = { IDC_HDR_POSITION, IDC_HDR_TEXT, IDC_HDR_APPEARANCE, IDC_HDR_BEHAVIOUR };
+        for (int hid : headerIds) {
+            HWND hctl = GetDlgItem(hwnd, hid);
+            if (hctl) SendMessage(hctl, WM_SETFONT, reinterpret_cast<WPARAM>(hHead), TRUE);
+        }
 
         return 0;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        HWND ctrl = reinterpret_cast<HWND>(lParam);
+        int id = GetDlgCtrlID(ctrl);
+        SetBkMode(hdc, TRANSPARENT);
+        if (id == IDC_HDR_POSITION || id == IDC_HDR_TEXT ||
+            id == IDC_HDR_APPEARANCE || id == IDC_HDR_BEHAVIOUR) {
+            SetTextColor(hdc, kDlgAccent);
+        } else {
+            SetTextColor(hdc, kDlgText);
+        }
+        return reinterpret_cast<LRESULT>(g_dlgBgBrush);
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, kDlgText);
+        SetBkColor(hdc, kDlgEditBg);
+        return reinterpret_cast<LRESULT>(g_editBgBrush);
+    }
+
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_dlgBgBrush);
+        HBRUSH sepBr = CreateSolidBrush(kDlgSep);
+        for (int i = 0; i < g_sepCount; ++i) {
+            RECT sr = { g_seps[i].x, g_seps[i].y, g_seps[i].x + g_seps[i].w, g_seps[i].y + 1 };
+            FillRect(hdc, &sr, sepBr);
+        }
+        DeleteObject(sepBr);
+        return 1;
+    }
+
+    case WM_DRAWITEM: {
+        auto *dis = reinterpret_cast<DRAWITEMSTRUCT *>(lParam);
+        bool isAccent = (dis->CtlID == IDC_BTN_OK);
+        bool hovered = (dis->itemState & ODS_FOCUS) || (dis->itemState & ODS_SELECTED);
+
+        COLORREF bg = isAccent ? kDlgAccent : (hovered ? kDlgBtnHover : kDlgBtnBg);
+        COLORREF fg = isAccent ? RGB(255,255,255) : kDlgText;
+
+        HBRUSH br = CreateSolidBrush(bg);
+        HPEN pen = CreatePen(PS_SOLID, 1, isAccent ? kDlgAccent : kDlgEditBor);
+        SelectObject(dis->hDC, br);
+        SelectObject(dis->hDC, pen);
+        RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+                  dis->rcItem.right, dis->rcItem.bottom, 6, 6);
+
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, fg);
+        wchar_t txt[64] = {};
+        GetWindowTextW(dis->hwndItem, txt, 64);
+        DrawTextW(dis->hDC, txt, -1, &dis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        DeleteObject(br);
+        DeleteObject(pen);
+        return TRUE;
     }
 
     case WM_COMMAND:
@@ -660,18 +793,19 @@ static void openSettingsDialog() {
     HINSTANCE hInst = GetModuleHandle(nullptr);
 
     if (!registered) {
+        if (!g_dlgBgBrush) g_dlgBgBrush = CreateSolidBrush(kDlgBg);
         WNDCLASSEXW wc = {};
-        wc.cbSize      = sizeof(wc);
-        wc.lpfnWndProc = settingsWndProc;
-        wc.hInstance   = hInst;
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = settingsWndProc;
+        wc.hInstance     = hInst;
         wc.lpszClassName = cls;
-        wc.hCursor     = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_dlgBgBrush;
         RegisterClassExW(&wc);
         registered = true;
     }
 
-    int dlgW = 260, dlgH = 440;
+    int dlgW = 290, dlgH = 540;
     g.settingsDlg = CreateWindowExW(
         WS_EX_TOOLWINDOW,
         cls, L"Voice Overlay Settings",

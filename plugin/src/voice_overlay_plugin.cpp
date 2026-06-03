@@ -601,9 +601,9 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (!g_dlgBgBrush)  g_dlgBgBrush  = CreateSolidBrush(kDlgBg);
         if (!g_editBgBrush) g_editBgBrush = CreateSolidBrush(kDlgEditBg);
 
-        // Dark title bar (Windows 10 1809+)
+        // Dark title bar (Windows 10 2004+, silently ignored on older)
         BOOL useDark = TRUE;
-        DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &useDark, sizeof(useDark));
+        DwmSetWindowAttribute(hwnd, 20, &useDark, sizeof(useDark));
 
         const int lblW = 130, editW = 90, rowH = 26, pad = 12;
         const int startX = 20, contentW = lblW + pad + editW;
@@ -670,7 +670,7 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             return TRUE;
         }, reinterpret_cast<LPARAM>(hBody));
 
-        int headerIds[] = { IDC_HDR_POSITION, IDC_HDR_TEXT, IDC_HDR_APPEARANCE, IDC_HDR_BEHAVIOUR };
+        int headerIds[] = { IDC_HDR_POSITION, IDC_HDR_APPEARANCE, IDC_HDR_BEHAVIOUR };
         for (int hid : headerIds) {
             HWND hctl = GetDlgItem(hwnd, hid);
             if (hctl) SendMessage(hctl, WM_SETFONT, reinterpret_cast<WPARAM>(hHead), TRUE);
@@ -684,8 +684,8 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         HWND ctrl = reinterpret_cast<HWND>(lParam);
         int id = GetDlgCtrlID(ctrl);
         SetBkMode(hdc, TRANSPARENT);
-        if (id == IDC_HDR_POSITION || id == IDC_HDR_TEXT ||
-            id == IDC_HDR_APPEARANCE || id == IDC_HDR_BEHAVIOUR) {
+        if (id == IDC_HDR_POSITION || id == IDC_HDR_APPEARANCE ||
+            id == IDC_HDR_BEHAVIOUR) {
             SetTextColor(hdc, kDlgAccent);
         } else {
             SetTextColor(hdc, kDlgText);
@@ -701,41 +701,49 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     }
 
     case WM_ERASEBKGND: {
+        if (!g_dlgBgBrush) return 0;
         HDC hdc = reinterpret_cast<HDC>(wParam);
         RECT rc; GetClientRect(hwnd, &rc);
         FillRect(hdc, &rc, g_dlgBgBrush);
-        HBRUSH sepBr = CreateSolidBrush(kDlgSep);
-        for (int i = 0; i < g_sepCount; ++i) {
-            RECT sr = { g_seps[i].x, g_seps[i].y, g_seps[i].x + g_seps[i].w, g_seps[i].y + 1 };
-            FillRect(hdc, &sr, sepBr);
+        if (g_sepCount > 0) {
+            HBRUSH sepBr = CreateSolidBrush(kDlgSep);
+            for (int i = 0; i < g_sepCount; ++i) {
+                RECT sr = { static_cast<LONG>(g_seps[i].x), static_cast<LONG>(g_seps[i].y),
+                             static_cast<LONG>(g_seps[i].x + g_seps[i].w), static_cast<LONG>(g_seps[i].y + 1) };
+                FillRect(hdc, &sr, sepBr);
+            }
+            DeleteObject(sepBr);
         }
-        DeleteObject(sepBr);
         return 1;
     }
 
     case WM_DRAWITEM: {
         auto *dis = reinterpret_cast<DRAWITEMSTRUCT *>(lParam);
+        if (dis->CtlType != ODT_BUTTON) break;
         bool isAccent = (dis->CtlID == IDC_BTN_OK);
-        bool hovered = (dis->itemState & ODS_FOCUS) || (dis->itemState & ODS_SELECTED);
+        bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
 
-        COLORREF bg = isAccent ? kDlgAccent : (hovered ? kDlgBtnHover : kDlgBtnBg);
+        COLORREF bg = isAccent ? (pressed ? RGB(70,120,230) : kDlgAccent)
+                               : (pressed ? kDlgBtnHover : kDlgBtnBg);
         COLORREF fg = isAccent ? RGB(255,255,255) : kDlgText;
+        COLORREF border = isAccent ? kDlgAccent : kDlgEditBor;
 
         HBRUSH br = CreateSolidBrush(bg);
-        HPEN pen = CreatePen(PS_SOLID, 1, isAccent ? kDlgAccent : kDlgEditBor);
-        SelectObject(dis->hDC, br);
-        SelectObject(dis->hDC, pen);
+        HPEN pen = CreatePen(PS_SOLID, 1, border);
+        HGDIOBJ oldBr  = SelectObject(dis->hDC, br);
+        HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
         RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
                   dis->rcItem.right, dis->rcItem.bottom, 6, 6);
+        SelectObject(dis->hDC, oldBr);
+        SelectObject(dis->hDC, oldPen);
+        DeleteObject(br);
+        DeleteObject(pen);
 
         SetBkMode(dis->hDC, TRANSPARENT);
         SetTextColor(dis->hDC, fg);
         wchar_t txt[64] = {};
         GetWindowTextW(dis->hwndItem, txt, 64);
         DrawTextW(dis->hDC, txt, -1, &dis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-        DeleteObject(br);
-        DeleteObject(pen);
         return TRUE;
     }
 

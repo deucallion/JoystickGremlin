@@ -607,59 +607,42 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
         const int lblW = 130, editW = 90, rowH = 26, pad = 12;
         const int startX = 20, contentW = lblW + pad + editW;
+        const int ex = startX + lblW + pad;
+
+        auto row = [&](int &y, int lblId, const wchar_t *label, int editId) {
+            createLabel(hwnd, lblId, label, startX, y + 3, lblW, rowH - 4);
+            createEdit(hwnd, editId, L"", ex, y, editW, rowH);
+            y += rowH + 4;
+        };
+
         int y = 16;
 
         // --- Section: Position ---
         createSectionHeader(hwnd, IDC_HDR_POSITION, L"POSITION", startX, y, contentW);
         y += 22;
-        struct Row { int lblId; const wchar_t *label; int editId; };
-        Row posRows[] = {
-            { IDC_LBL_X, L"X:", IDC_EDIT_X },
-            { IDC_LBL_Y, L"Y:", IDC_EDIT_Y },
-        };
-        for (auto &r : posRows) {
-            createLabel(hwnd, r.lblId, r.label, startX, y + 3, lblW, rowH - 4);
-            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH);
-            y += rowH + 4;
-        }
+        row(y, IDC_LBL_X, L"X:", IDC_EDIT_X);
+        row(y, IDC_LBL_Y, L"Y:", IDC_EDIT_Y);
 
-        y += 6;
-        addSeparator(startX, y, contentW);
-        y += 10;
+        y += 6; addSeparator(startX, y, contentW); y += 10;
 
         // --- Section: Appearance ---
         createSectionHeader(hwnd, IDC_HDR_APPEARANCE, L"APPEARANCE", startX, y, contentW);
         y += 22;
-        Row appRows[] = {
-            { IDC_LBL_WIDTH,    L"Card width:",     IDC_EDIT_WIDTH },
-            { IDC_LBL_CARDH,    L"Card height:",    IDC_EDIT_CARDH },
-            { IDC_LBL_SPACING,  L"Card spacing:",   IDC_EDIT_SPACING },
-            { IDC_LBL_NAMEFONT, L"Name font (pt):", IDC_EDIT_NAMEFONT },
-            { IDC_LBL_METAFONT, L"Meta font (pt):", IDC_EDIT_METAFONT },
-            { IDC_LBL_OPACITY,  L"Opacity (0\x20131):", IDC_EDIT_OPACITY },
-        };
-        for (auto &r : appRows) {
-            createLabel(hwnd, r.lblId, r.label, startX, y + 3, lblW, rowH - 4);
-            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH);
-            y += rowH + 4;
-        }
+        row(y, IDC_LBL_WIDTH,    L"Card width:",     IDC_EDIT_WIDTH);
+        row(y, IDC_LBL_CARDH,    L"Card height:",    IDC_EDIT_CARDH);
+        row(y, IDC_LBL_SPACING,  L"Card spacing:",   IDC_EDIT_SPACING);
+        row(y, IDC_LBL_NAMEFONT, L"Name font (pt):", IDC_EDIT_NAMEFONT);
+        row(y, IDC_LBL_METAFONT, L"Meta font (pt):", IDC_EDIT_METAFONT);
+        row(y, IDC_LBL_OPACITY,  L"Opacity (0" L"\x2013" L"1):", IDC_EDIT_OPACITY);
 
-        y += 6;
-        addSeparator(startX, y, contentW);
-        y += 10;
+        y += 6; addSeparator(startX, y, contentW); y += 10;
 
         // --- Section: Behaviour ---
         createSectionHeader(hwnd, IDC_HDR_BEHAVIOUR, L"BEHAVIOUR", startX, y, contentW);
         y += 22;
-        Row behRows[] = {
-            { IDC_LBL_LINGER,   L"Linger (ms):", IDC_EDIT_LINGER },
-            { IDC_LBL_MAXCARDS, L"Max cards:",   IDC_EDIT_MAXCARDS },
-        };
-        for (auto &r : behRows) {
-            createLabel(hwnd, r.lblId, r.label, startX, y + 3, lblW, rowH - 4);
-            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH);
-            y += rowH + 4;
-        }
+        row(y, IDC_LBL_LINGER,   L"Linger (ms):", IDC_EDIT_LINGER);
+        row(y, IDC_LBL_MAXCARDS, L"Max cards:",   IDC_EDIT_MAXCARDS);
+
         y += 4;
         createCheck(hwnd, IDC_CHK_SHOWSELF,    L"Show my own card",  startX + 4, y, 220, 20, g.config.showSelf);
         y += 26;
@@ -667,7 +650,7 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         y += 36;
 
         // --- Buttons ---
-        drawSeparator(hwnd, startX, y - 10, contentW);
+        addSeparator(startX, y - 10, contentW);
         int btnW = 76, btnH = 30;
         int bx = startX + contentW - btnW;
         createButton(hwnd, IDC_BTN_CANCEL, L"Cancel", bx, y, btnW, btnH);

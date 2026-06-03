@@ -273,6 +273,8 @@ struct PluginState {
     NOTIFYICONDATAW trayData = {};
     bool trayAdded = false;
     UINT wmTaskbarCreated = 0;
+    bool overlayEnabled = true;   // toggled by left-clicking the tray icon
+    HWND settingsDlg = nullptr;   // non-null while the settings dialog is open
 #endif
 };
 
@@ -430,9 +432,27 @@ static bool isKnown(mumble_userid_t u) {
 #if defined(_WIN32)
 
 // Menu command IDs
-enum { CMD_SHOWSELF = 1001, CMD_SHOWCHANNEL, CMD_RELOAD, CMD_OPENCONFIG, CMD_CLOSE };
+enum {
+    CMD_TOGGLE = 1001, CMD_SHOWSELF, CMD_SHOWCHANNEL,
+    CMD_SETTINGS, CMD_CLOSE
+};
 // Custom window messages
 enum { WM_REPAINT = WM_USER + 1, WM_TRAY = WM_USER + 2, WM_RELOAD = WM_USER + 3 };
+
+// Settings dialog control IDs
+enum {
+    IDC_LBL_X = 2001, IDC_EDIT_X, IDC_LBL_Y, IDC_EDIT_Y,
+    IDC_LBL_WIDTH, IDC_EDIT_WIDTH,
+    IDC_LBL_CARDH, IDC_EDIT_CARDH,
+    IDC_LBL_SPACING, IDC_EDIT_SPACING,
+    IDC_LBL_NAMEFONT, IDC_EDIT_NAMEFONT,
+    IDC_LBL_METAFONT, IDC_EDIT_METAFONT,
+    IDC_LBL_OPACITY, IDC_EDIT_OPACITY,
+    IDC_LBL_LINGER, IDC_EDIT_LINGER,
+    IDC_LBL_MAXCARDS, IDC_EDIT_MAXCARDS,
+    IDC_CHK_SHOWSELF, IDC_CHK_SHOWCHANNEL,
+    IDC_BTN_OK, IDC_BTN_CANCEL, IDC_BTN_APPLY
+};
 
 static std::wstring toWide(const std::string &s) {
     if (s.empty()) return {};
@@ -461,8 +481,217 @@ static std::string stripHtml(const std::string &html) {
     return r;
 }
 
+// -- Settings dialog (Win32 native) ------------------------------------------
+
+static HWND createLabel(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h) {
+    return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                           x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
+                           GetModuleHandle(nullptr), nullptr);
+}
+
+static HWND createEdit(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h) {
+    HWND hw = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text,
+                              WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                              x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
+                              GetModuleHandle(nullptr), nullptr);
+    return hw;
+}
+
+static HWND createCheck(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h, bool checked) {
+    HWND hw = CreateWindowExW(0, L"BUTTON", text,
+                              WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                              x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
+                              GetModuleHandle(nullptr), nullptr);
+    SendMessage(hw, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+    return hw;
+}
+
+static HWND createButton(HWND parent, int id, const wchar_t *text, int x, int y, int w, int h) {
+    return CreateWindowExW(0, L"BUTTON", text,
+                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                           x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<intptr_t>(id)),
+                           GetModuleHandle(nullptr), nullptr);
+}
+
+static int getEditInt(HWND dlg, int id) {
+    wchar_t buf[64] = {};
+    GetDlgItemTextW(dlg, id, buf, 64);
+    return _wtoi(buf);
+}
+
+static float getEditFloat(HWND dlg, int id) {
+    wchar_t buf[64] = {};
+    GetDlgItemTextW(dlg, id, buf, 64);
+    return static_cast<float>(_wtof(buf));
+}
+
+static void setEditInt(HWND dlg, int id, int val) {
+    wchar_t buf[32]; swprintf_s(buf, L"%d", val);
+    SetDlgItemTextW(dlg, id, buf);
+}
+
+static void setEditFloat(HWND dlg, int id, float val, int decimals = 1) {
+    wchar_t buf[32];
+    if (decimals == 2) swprintf_s(buf, L"%.2f", val);
+    else               swprintf_s(buf, L"%.1f", val);
+    SetDlgItemTextW(dlg, id, buf);
+}
+
+static void applySettingsFromDialog(HWND dlg) {
+    std::lock_guard<std::mutex> lk(g.mutex);
+    g.config.x           = getEditInt  (dlg, IDC_EDIT_X);
+    g.config.y           = getEditInt  (dlg, IDC_EDIT_Y);
+    g.config.width       = getEditInt  (dlg, IDC_EDIT_WIDTH);
+    g.config.cardHeight  = getEditInt  (dlg, IDC_EDIT_CARDH);
+    g.config.cardSpacing = getEditInt  (dlg, IDC_EDIT_SPACING);
+    g.config.nameFontPt  = getEditFloat(dlg, IDC_EDIT_NAMEFONT);
+    g.config.metaFontPt  = getEditFloat(dlg, IDC_EDIT_METAFONT);
+    g.config.opacity     = getEditFloat(dlg, IDC_EDIT_OPACITY);
+    g.config.lingerMs    = getEditInt  (dlg, IDC_EDIT_LINGER);
+    g.config.maxCards    = getEditInt  (dlg, IDC_EDIT_MAXCARDS);
+    g.config.showSelf    = IsDlgButtonChecked(dlg, IDC_CHK_SHOWSELF) == BST_CHECKED;
+    g.config.showChannel = IsDlgButtonChecked(dlg, IDC_CHK_SHOWCHANNEL) == BST_CHECKED;
+    saveConfig(g.config);
+    if (g.overlayWnd) PostMessage(g.overlayWnd, WM_REPAINT, 0, 0);
+}
+
+static void populateDialogFromConfig(HWND dlg) {
+    setEditInt  (dlg, IDC_EDIT_X,        g.config.x);
+    setEditInt  (dlg, IDC_EDIT_Y,        g.config.y);
+    setEditInt  (dlg, IDC_EDIT_WIDTH,    g.config.width);
+    setEditInt  (dlg, IDC_EDIT_CARDH,    g.config.cardHeight);
+    setEditInt  (dlg, IDC_EDIT_SPACING,  g.config.cardSpacing);
+    setEditFloat(dlg, IDC_EDIT_NAMEFONT, g.config.nameFontPt);
+    setEditFloat(dlg, IDC_EDIT_METAFONT, g.config.metaFontPt);
+    setEditFloat(dlg, IDC_EDIT_OPACITY,  g.config.opacity, 2);
+    setEditInt  (dlg, IDC_EDIT_LINGER,   g.config.lingerMs);
+    setEditInt  (dlg, IDC_EDIT_MAXCARDS, g.config.maxCards);
+    CheckDlgButton(dlg, IDC_CHK_SHOWSELF,    g.config.showSelf    ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(dlg, IDC_CHK_SHOWCHANNEL, g.config.showChannel ? BST_CHECKED : BST_UNCHECKED);
+}
+
+static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        // Set dark background
+        // Build the form: labels on the left, edits on the right
+        const int lblW = 120, editW = 80, rowH = 24, pad = 10, startY = 15, startX = 15;
+        int y = startY;
+
+        struct Row { int lblId; const wchar_t *label; int editId; };
+        Row rows[] = {
+            { IDC_LBL_X,        L"Position X:",     IDC_EDIT_X },
+            { IDC_LBL_Y,        L"Position Y:",     IDC_EDIT_Y },
+            { IDC_LBL_WIDTH,    L"Card width:",     IDC_EDIT_WIDTH },
+            { IDC_LBL_CARDH,    L"Card height:",    IDC_EDIT_CARDH },
+            { IDC_LBL_SPACING,  L"Card spacing:",   IDC_EDIT_SPACING },
+            { IDC_LBL_NAMEFONT, L"Name font (pt):", IDC_EDIT_NAMEFONT },
+            { IDC_LBL_METAFONT, L"Meta font (pt):", IDC_EDIT_METAFONT },
+            { IDC_LBL_OPACITY,  L"Opacity (0-1):",  IDC_EDIT_OPACITY },
+            { IDC_LBL_LINGER,   L"Linger (ms):",    IDC_EDIT_LINGER },
+            { IDC_LBL_MAXCARDS, L"Max cards:",      IDC_EDIT_MAXCARDS },
+        };
+
+        for (auto &r : rows) {
+            createLabel(hwnd, r.lblId, r.label, startX, y + 2, lblW, rowH - 4);
+            createEdit(hwnd, r.editId, L"", startX + lblW + pad, y, editW, rowH - 2);
+            y += rowH + 4;
+        }
+
+        y += 4;
+        createCheck(hwnd, IDC_CHK_SHOWSELF,    L"Show my own card",  startX + 6, y, 200, 20, g.config.showSelf);
+        y += 26;
+        createCheck(hwnd, IDC_CHK_SHOWCHANNEL, L"Show channel name", startX + 6, y, 200, 20, g.config.showChannel);
+        y += 36;
+
+        int btnW = 70, btnH = 28;
+        int btnArea = startX + lblW + pad + editW;
+        createButton(hwnd, IDC_BTN_APPLY,  L"Apply",  btnArea - btnW * 3 - 16, y, btnW, btnH);
+        createButton(hwnd, IDC_BTN_OK,     L"OK",     btnArea - btnW * 2 - 8,  y, btnW, btnH);
+        createButton(hwnd, IDC_BTN_CANCEL, L"Cancel", btnArea - btnW,          y, btnW, btnH);
+
+        populateDialogFromConfig(hwnd);
+
+        // Set font on all child controls
+        HFONT hFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
+            SendMessage(child, WM_SETFONT, static_cast<WPARAM>(lp), TRUE);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(hFont));
+
+        return 0;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_BTN_APPLY:
+            applySettingsFromDialog(hwnd);
+            return 0;
+        case IDC_BTN_OK:
+            applySettingsFromDialog(hwnd);
+            DestroyWindow(hwnd);
+            return 0;
+        case IDC_BTN_CANCEL:
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_DESTROY:
+        g.settingsDlg = nullptr;
+        return 0;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void openSettingsDialog() {
+    if (g.settingsDlg) {
+        SetForegroundWindow(g.settingsDlg);
+        return;
+    }
+
+    static bool registered = false;
+    const wchar_t *cls = L"MumbleVoiceOverlaySettings";
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize      = sizeof(wc);
+        wc.lpfnWndProc = settingsWndProc;
+        wc.hInstance   = hInst;
+        wc.lpszClassName = cls;
+        wc.hCursor     = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    int dlgW = 260, dlgH = 440;
+    g.settingsDlg = CreateWindowExW(
+        WS_EX_TOOLWINDOW,
+        cls, L"Voice Overlay Settings",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, dlgW, dlgH,
+        nullptr, nullptr, hInst, nullptr);
+
+    ShowWindow(g.settingsDlg, SW_SHOW);
+    SetForegroundWindow(g.settingsDlg);
+}
+
+// -- Overlay painting --------------------------------------------------------
+
 static void paintOverlay(HWND hwnd) {
     std::lock_guard<std::mutex> lk(g.mutex);
+
+    if (!g.overlayEnabled) {
+        ShowWindow(hwnd, SW_HIDE);
+        return;
+    }
 
     auto speakers = buildSnapshot();
 
@@ -724,52 +953,53 @@ static void removeTrayIcon() {
     if (g.trayAdded) { Shell_NotifyIconW(NIM_DELETE, &g.trayData); g.trayAdded = false; }
 }
 
+static void updateTrayTip() {
+    if (!g.trayAdded) return;
+    wcscpy_s(g.trayData.szTip,
+             g.overlayEnabled ? L"Voice Overlay (ON)" : L"Voice Overlay (OFF)");
+    Shell_NotifyIconW(NIM_MODIFY, &g.trayData);
+}
+
 static void showTrayMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
 
-    AppendMenuW(menu, MF_STRING | (g.config.showSelf    ? MF_CHECKED : MF_UNCHECKED), CMD_SHOWSELF,    L"Show my own card");
-    AppendMenuW(menu, MF_STRING | (g.config.showChannel ? MF_CHECKED : MF_UNCHECKED), CMD_SHOWCHANNEL, L"Show channel name");
+    AppendMenuW(menu, MF_STRING | (g.overlayEnabled ? MF_CHECKED : MF_UNCHECKED),
+                CMD_TOGGLE, L"Overlay enabled");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, CMD_RELOAD,     L"Reload config from file");
-    AppendMenuW(menu, MF_STRING, CMD_OPENCONFIG, L"Edit config file...");
+    AppendMenuW(menu, MF_STRING | (g.config.showSelf    ? MF_CHECKED : MF_UNCHECKED),
+                CMD_SHOWSELF, L"Show my own card");
+    AppendMenuW(menu, MF_STRING | (g.config.showChannel ? MF_CHECKED : MF_UNCHECKED),
+                CMD_SHOWCHANNEL, L"Show channel name");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, CMD_CLOSE,      L"Close overlay");
+    AppendMenuW(menu, MF_STRING, CMD_SETTINGS, L"Settings...");
 
-    // Required so the menu dismisses when clicking elsewhere
     SetForegroundWindow(hwnd);
-
     POINT pt; GetCursorPos(&pt);
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
                              pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
 
-    std::lock_guard<std::mutex> lk(g.mutex);
-
     switch (cmd) {
-    case CMD_SHOWSELF:
+    case CMD_TOGGLE: {
+        std::lock_guard<std::mutex> lk(g.mutex);
+        g.overlayEnabled = !g.overlayEnabled;
+        updateTrayTip();
+        break;
+    }
+    case CMD_SHOWSELF: {
+        std::lock_guard<std::mutex> lk(g.mutex);
         g.config.showSelf = !g.config.showSelf;
         saveConfig(g.config);
         break;
-
-    case CMD_SHOWCHANNEL:
+    }
+    case CMD_SHOWCHANNEL: {
+        std::lock_guard<std::mutex> lk(g.mutex);
         g.config.showChannel = !g.config.showChannel;
         saveConfig(g.config);
         break;
-
-    case CMD_RELOAD:
-        PostMessage(hwnd, WM_RELOAD, 0, 0);
-        break;
-
-    case CMD_OPENCONFIG: {
-        // Write the config file first so there's something to open
-        saveConfig(g.config);
-        std::wstring path = configPath();
-        ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOW);
-        break;
     }
-
-    case CMD_CLOSE:
-        PostMessage(hwnd, WM_CLOSE, 0, 0);
+    case CMD_SETTINGS:
+        openSettingsDialog();
         break;
     }
 
@@ -800,6 +1030,11 @@ static LRESULT CALLBACK overlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     case WM_TRAY:
         if (lParam == WM_RBUTTONUP) {
             showTrayMenu(hwnd);
+        } else if (lParam == WM_LBUTTONUP) {
+            // Left-click toggles overlay on/off
+            { std::lock_guard<std::mutex> lk(g.mutex); g.overlayEnabled = !g.overlayEnabled; }
+            updateTrayTip();
+            paintOverlay(hwnd);
         }
         return 0;
 

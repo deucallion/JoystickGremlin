@@ -676,16 +676,6 @@ static LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (hctl) SendMessage(hctl, WM_SETFONT, reinterpret_cast<WPARAM>(hHead), TRUE);
         }
 
-        // Resize window to fit content exactly
-        int clientW = startX + contentW + startX;
-        int clientH = y + btnH + 16;
-        DWORD style   = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_STYLE));
-        DWORD exStyle = static_cast<DWORD>(GetWindowLongPtr(hwnd, GWL_EXSTYLE));
-        RECT rc = { 0, 0, clientW, clientH };
-        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
-        SetWindowPos(hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
-                     SWP_NOMOVE | SWP_NOZORDER);
-
         return 0;
     }
 
@@ -806,11 +796,26 @@ static void openSettingsDialog() {
         registered = true;
     }
 
+    // Compute client size from layout constants (must match WM_CREATE)
+    const int rowH = 30, startX = 20, contentW = 130 + 12 + 90;
+    int cy = 16;
+    cy += 22 + 2 * rowH;                  // POSITION: header + 2 rows
+    cy += 16;                              // separator gap
+    cy += 22 + 6 * rowH;                  // APPEARANCE: header + 6 rows
+    cy += 16;                              // separator gap
+    cy += 22 + 2 * rowH;                  // BEHAVIOUR: header + 2 rows
+    cy += 4 + 26 + 36;                    // checkboxes
+    cy += 30 + 16;                         // buttons + bottom pad
+
+    DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    DWORD exStyle = WS_EX_TOOLWINDOW;
+    RECT rc = { 0, 0, startX + contentW + startX, cy };
+    AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+
     g.settingsDlg = CreateWindowExW(
-        WS_EX_TOOLWINDOW,
-        cls, L"Voice Overlay Settings",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 300, 100,
+        exStyle, cls, L"Voice Overlay Settings", style,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        rc.right - rc.left, rc.bottom - rc.top,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g.settingsDlg, SW_SHOW);

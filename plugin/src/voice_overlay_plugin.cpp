@@ -561,16 +561,20 @@ static void paintOverlay(HWND hwnd) {
             Gdiplus::SolidBrush bgBrush(Gdiplus::Color(static_cast<BYTE>(215 * cop), 10, 15, 20));
             gfx.FillPath(&bgBrush, &path);
 
-            // Subtle accent bloom on the left ~30% of the card
-            Gdiplus::SolidBrush bloomBrush(Gdiplus::Color(static_cast<BYTE>(38 * cop), accentR, accentG, accentB));
-            Gdiplus::GraphicsPath bloomPath;
-            int bw = w * 3 / 10;
-            bloomPath.AddArc(rc.X, rc.Y, r*2, r*2, 180, 90);
-            bloomPath.AddLine(rc.X + r, rc.Y, rc.X + bw, rc.Y);
-            bloomPath.AddLine(rc.X + bw, rc.Y, rc.X + bw, rc.Y + rc.Height);
-            bloomPath.AddArc(rc.X, rc.Y + rc.Height - r*2, r*2, r*2, 90, 90);
-            bloomPath.CloseFigure();
-            gfx.FillPath(&bloomBrush, &bloomPath);
+            // Full-width accent gradient: ~8% opacity on left, fading to transparent
+            Gdiplus::LinearGradientBrush gradBrush(
+                Gdiplus::PointF(static_cast<float>(rc.X), 0),
+                Gdiplus::PointF(static_cast<float>(rc.X + rc.Width), 0),
+                Gdiplus::Color(static_cast<BYTE>(20 * cop), accentR, accentG, accentB),
+                Gdiplus::Color(0, accentR, accentG, accentB));
+            Gdiplus::REAL positions[] = { 0.0f, 0.6f, 1.0f };
+            Gdiplus::Color colors[] = {
+                Gdiplus::Color(static_cast<BYTE>(20 * cop), accentR, accentG, accentB),
+                Gdiplus::Color(0, accentR, accentG, accentB),
+                Gdiplus::Color(0, accentR, accentG, accentB)
+            };
+            gradBrush.SetInterpolationColors(colors, positions, 3);
+            gfx.FillPath(&gradBrush, &path);
 
             // Accent rail (3px left edge bar)
             Gdiplus::SolidBrush railBrush(Gdiplus::Color(static_cast<BYTE>(235 * cop), accentR, accentG, accentB));
